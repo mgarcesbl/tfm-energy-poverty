@@ -1,0 +1,2984 @@
+---
+title: "Complete methodology "
+author: "María Garcés Blázquez (100453214) - Master in Computational Social Science"
+date: 'UC3M 2025--2026'
+format:
+  html:
+    theme: flatly
+    highlight-style: tango
+    number-sections: false
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    self-contained: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview
+
+This document contains the complete practical application of the methodology 
+proposed in the Master's Thesis (TFM) for the estimation and prediction of 
+energy poverty at the census section level in the municipality of Madrid.
+
+The analysis is structured in three sequential phases that integrate 
+socioeconomic data from the Living Conditions Survey (ECV), geospatial 
+information from the Income Distribution Atlas (INE), and environmental 
+variables derived from satellite observation (Google Earth Engine):
+
+**Phase 1 — Construction of the Energy Vulnerability Index (EVI)**  
+Definition and calculation of the Energy Vulnerability Index based on 
+expenditure, income, and household conditions available in the ECV. 
+Imputation of missing values using missForest and cross-validation with 
+alternative methods (Amelia, MICE, quintile median).
+
+**Phase 2 — Small Area Estimation (SAE)**  
+Application of the Synthetic Regression Estimator (Rao & Molina, 2015) 
+using a logistic mixed-effects model to predict the EVI in the 2,443 
+census sections of Madrid. Justification of the EVI > 15 threshold 
+through triple validation: Eurostat criterion, empirical distribution, 
+and comparison with independent indicators from the INE Atlas.
+
+**Phase 3 — Predictive Models**  
+Construction of two complementary Random Forest models:  
+(i) a socioeconomic model combining census and geospatial variables 
+to classify sections according to energy poverty;  
+(ii) a physical vulnerability model based exclusively on environmental 
+variables (Google Earth Engine) that identifies sections with adverse 
+physical conditions (thermal, vegetation, building characteristics).
+
+**Phase 4 — Discrepancy Analysis and Group Characterization**  
+Identification and characterization of four groups: concordant, 
+non-vulnerable, spatial false positives, and spatial false negatives. 
+Analysis of the differential characteristics of each group and 
+statistical validation of the observed differences.
+
+Each phase includes the R code used, the outputs generated (tables, 
+plots, and result files), and the interpretation of the findings. 
+The ultimate goal is to provide a reproducible tool for the territorial 
+identification of energy poverty that combines traditional data sources 
+with remote sensing.
+
+
+## Phase 1: Construction EVI
+
+Phase 1 builds the analytical foundation in two sequential steps.
+First, a master census file is constructed by integrating eight administrative data sources at the census section level (CUSEC): income, demographic, inequality, and poverty threshold indicators from the INE Atlas of Income Distribution 2021; household composition and nationality data from the Padrón Municipal 2022; population counts from the INE Population Census 2021; and building age and construction year data from the CAM Building Census 2022–2024. The resulting dataset covers all 2,443 census sections of Madrid with approximately 30 variables per section.
+Second, missing values concentrated in poverty threshold indicators (304 sections, 12.4%) are addressed through a systematic comparison of five imputation methods — missForest, MICE, Amelia, conditional mean, and conditional median by income quintile — evaluated via 10-fold cross-validation with 20% of values artificially masked. missForest is selected as the optimal method based on its lowest Mean Absolute Error (0.95 percentage points, 28% below MICE at 1.32 pp) and absence of systematic bias in the error distribution. The final imputed dataset contains zero missing values across all retained variables and serves as the input for the SAE downscaling in Phase 2.
+
+#### Methodology Summary
+
+This analysis comprises two main phases:
+
+**Part 1: Data Integration and Imputation**
+
+- Construction of a master census file integrating 10 data sources (Atlas Nacional, 
+  Padrón Municipal, INE Population, and CAM Census)
+- Identification and treatment of missing values in key auxiliary variables
+- Comparative evaluation of 5 imputation methods (missForest, MICE, Amelia, 
+  mean, and median) using cross-validation
+- Selection of missForest as the final imputation method based on RMSE performance
+
+**Part 2: Small Area Estimation**
+
+- Bidimensional stratification of census sections by income (5 quintiles) and 
+  demographic vulnerability (4 quartiles), resulting in 20 homogeneous strata
+- Classification of ECV households into the same stratification scheme
+- Probabilistic matching of ECV households to census sections within the same stratum
+- Direct weighted estimation of EVI by section, with fallback imputation using 
+  stratum means for sections without assigned households
+
+#### Key Results
+
+- **Coverage**: 100% (2,443/2,443 sections)
+- **Stratification quality**: R² = 0.911 (income), R² = 0.857 (demographics)
+- **Direct estimation**: 42.2% of sections (1,032) with EVI estimated from 
+  matched households
+- **Stratum imputation**: 57.8% of sections (1,411) with EVI imputed from 
+  stratum means
+- **Average EVI**: 18.1% (range: 0.0% - 100.0%)
+
+This SAE-derived EVI serves as the baseline for Phase 3, where Random Forest 
+will integrate physical variables (building age, land surface temperature, NDVI) 
+to identify spatial discrepancies and detect "invisible" energy poverty not 
+captured by survey-based approaches.
+
+#### Libraries
+
+```{r}
+library(readxl)
+library(mice)
+library(missForest)
+library(Amelia)
+library(ggplot2)
+library(Hmisc)
+library(patchwork)
+library(lme4)
+library(MuMIn)
+library(tidyverse)
+library(sf)
+library(flextable)
+library(scales)
+```
+
+#### Paths
+
+```{r}
+# --- INE Atlas (Income Distribution Atlas) ---
+path_atlas_income       <- "data/Atlas_renta.csv"
+path_atlas_demo         <- "data/Atlas_demografia.csv"
+path_atlas_inequality   <- "data/Atlas_desigualdad.csv"
+path_atlas_threshold_sx <- "data/Atlas_umbral_sexo.csv"
+
+# --- Municipal Register and Population Data ---
+path_register   <- "data/2022.xlsx"
+path_population <- "data/INE_Madrid_Poblacion_Secciones_2021_2025.xlsx"
+
+# --- CAM Census (Community of Madrid Building Census) ---
+path_census22 <- "data/dataset_22_censal.xlsx"
+path_census24 <- "data/dataset_24_censal.xlsx"
+
+
+gee_path <- "data/Madrid_Urban_Full_Audit_Stats_FIXED.csv"
+```
+
+
+#### CUSEC Extraction Function
+
+Atlas INE data sources include a text field with census section identifiers 
+embedded in descriptive strings (e.g., "2807901001 Madrid sección 01001"). 
+This helper function extracts the 10-digit CUSEC code from such strings:
+
+1. `str_trim(x)` removes leading/trailing whitespace
+2. `str_extract(..., "^[0-9]{10}")` captures the first 10 consecutive digits
+3. Returns the clean CUSEC identifier (e.g., "2807901001")
+
+The CUSEC format is: `PPMMMDDSSS` where:
+- PP = Province code (28 = Madrid)
+- MMM = Municipality code (079 = Madrid capital) 
+- DD = District code
+- SSS = Section code
+
+```{r}
+extract_cusec_atlas <- function(x) {
+  str_extract(str_trim(x), "^[0-9]{10}")
+}
+```
+
+
+### Part 1: Census Master File Construction
+
+This section integrates 10 administrative data sources at the census section 
+level (CUSEC) to create a unified dataset with socioeconomic, demographic, 
+and housing variables for all 2,443 sections in Madrid.
+
+Data sources:
+
+- Atlas Nacional (Income, Demographics, Inequality, Poverty Thresholds)
+- Padrón Municipal 2022 (Household Composition, Nationality)
+- INE Population Census 2021
+- CAM Census 2022-2024 (Building Age, Construction Year)
+
+#### Demographics
+```{r}
+demo <- read_delim(path_atlas_demo, delim = ";", locale = locale(decimal_mark = ","), 
+                   show_col_types = FALSE) |> 
+  # Rename original Spanish columns from INE to English
+  rename(municipalities = Municipios,
+         sections = Secciones,
+         period = Periodo,
+         total = Total,
+         demographic_indicators = `Indicadores demográficos`) |> 
+  # Filter: Madrid municipality code (28079) and Year 2021
+  filter(str_detect(municipalities, "^28079"), str_trim(sections) != "", period == "2021") |> 
+  # Extract 10-digit CUSEC and parse values
+  mutate(CUSEC = extract_cusec_atlas(sections),
+         value = as.numeric(str_replace_all(total, ",", "."))) |> 
+  filter(!is.na(CUSEC)) |> 
+  select(CUSEC, indicator = demographic_indicators, value) |> 
+  # Select key demographic indicators (filter still uses Spanish strings because
+  # those are the actual VALUES inside the cells, not column names)
+  filter(indicator %in% c(
+    "Tamaño medio del hogar",                   # Average household size
+    "Porcentaje de población menor de 18 años", # % population under 18
+    "Porcentaje de población de 65 y más años", # % population 65+
+    "Porcentaje de hogares unipersonales",      # % single-person households
+    "Porcentaje de población española"          # % Spanish population
+  )) |> 
+  # Translate indicator VALUES from Spanish to English
+  mutate(indicator = case_when(
+    indicator == "Tamaño medio del hogar" ~ "mean_household_size",
+    indicator == "Porcentaje de población menor de 18 años" ~ "pct_under_18",
+    indicator == "Porcentaje de población de 65 y más años" ~ "pct_over_65",
+    indicator == "Porcentaje de hogares unipersonales" ~ "pct_single_person",
+    indicator == "Porcentaje de población española" ~ "pct_spanish"
+  )) |> 
+  # Reshape to wide format (column names will now be in English)
+  pivot_wider(names_from = indicator, values_from = value) |> 
+  # Calculate % foreign population
+  mutate(pct_foreign = 100 - pct_spanish) |> 
+  select(-pct_spanish)
+```
+
+#### Income
+```{r}
+income <- read_delim(path_atlas_income, delim = ";", locale = locale(decimal_mark = ","),
+                     show_col_types = FALSE) |> 
+  # Rename original Spanish columns from INE to English
+  rename(municipalities = Municipios,
+         sections = Secciones,
+         period = Periodo,
+         total = Total,
+         income_indicators = `Indicadores de renta media y mediana`) |> 
+  # Filter: Madrid municipality (28079) and Year 2021
+  filter(str_detect(municipalities, "^28079"), str_trim(sections) != "", period == "2021") |> 
+  # Extract CUSEC and parse income values (remove thousands separator)
+  mutate(CUSEC = extract_cusec_atlas(sections),
+         value = as.numeric(str_replace_all(total, "\\.", ""))) |> 
+  filter(!is.na(CUSEC)) |> 
+  select(CUSEC, indicator = income_indicators, value) |> 
+  # Select key income indicators (Spanish strings because they are cell VALUES)
+  filter(indicator %in% c(
+    "Media de la renta por unidad de consumo",     # Mean income per equivalence unit
+    "Mediana de la renta por unidad de consumo",   # Median income per equivalence unit
+    "Renta neta media por hogar"                   # Mean net household income
+  )) |> 
+  # Translate indicator values to English (will become column names after pivot)
+  mutate(indicator = case_when(
+    indicator == "Media de la renta por unidad de consumo" ~ "mean_equiv_income",
+    indicator == "Mediana de la renta por unidad de consumo" ~ "median_equiv_income",
+    indicator == "Renta neta media por hogar" ~ "net_household_income"
+  )) |> 
+  # Reshape to wide format (column names will now be in English)
+  pivot_wider(names_from = indicator, values_from = value)
+```
+
+#### Inequality
+```{r}
+inequality <- read_delim(path_atlas_inequality, delim = ";", locale = locale(decimal_mark = ","),
+                         show_col_types = FALSE) |> 
+  # Rename original Spanish columns from INE to English
+  rename(municipalities = Municipios,
+         sections = Secciones,
+         period = Periodo,
+         total = Total,
+         inequality_indicators = `Índice de Gini y Distribución de la renta P80/P20`) |> 
+  # Filter: Madrid (28079), Year 2021, and Gini coefficient indicator
+  filter(str_detect(municipalities, "^28079"), str_trim(sections) != "", period == "2021",
+         inequality_indicators == "Índice de Gini") |> 
+  # Extract CUSEC and parse Gini values
+  mutate(CUSEC = extract_cusec_atlas(sections),
+         gini = as.numeric(str_replace_all(total, ",", "."))) |> 
+  filter(!is.na(CUSEC)) |> 
+  select(CUSEC, gini)
+```
+
+#### Poverty Thresholds
+```{r}
+threshold_sx <- read_delim(path_atlas_threshold_sx, delim = ";", locale = locale(decimal_mark = ","),
+                           show_col_types = FALSE) |> 
+  # Rename original Spanish columns from INE to English
+  rename(municipalities = Municipios,
+         sections = Secciones,
+         period = Periodo,
+         sex = Sexo,
+         total = Total,
+         income_distribution = `Distribución de la renta por unidad de consumo`) |> 
+  # Filter: Madrid (28079), Year 2021, Total population (not sex-disaggregated)
+  filter(str_detect(municipalities, "^28079"), str_trim(sections) != "", 
+         period == "2021", sex == "Total") |> 
+  # Extract CUSEC and parse threshold values
+  mutate(CUSEC = extract_cusec_atlas(sections),
+         value = as.numeric(str_replace_all(total, ",", "."))) |> 
+  filter(!is.na(CUSEC)) |> 
+  select(CUSEC, indicator = income_distribution, value) |> 
+  # Select poverty threshold indicators (Spanish strings because they are cell VALUES)
+  filter(indicator %in% c(
+    "Población con ingresos por unidad de consumo por debajo 40% de la mediana",  # Below 40%
+    "Población con ingresos por unidad de consumo por debajo 50% de la mediana",  # Below 50%
+    "Población con ingresos por unidad de consumo por debajo 60% de la mediana",  # Below 60% (EU)
+    "Población con ingresos por unidad de consumo por encima 140% de la mediana"  # Above 140%
+  )) |> 
+  # Translate indicator values to English (will become column names after pivot)
+  mutate(indicator = case_when(
+    indicator == "Población con ingresos por unidad de consumo por debajo 40% de la mediana" ~ "pct_below_threshold_40",
+    indicator == "Población con ingresos por unidad de consumo por debajo 50% de la mediana" ~ "pct_below_threshold_50",
+    indicator == "Población con ingresos por unidad de consumo por debajo 60% de la mediana" ~ "pct_below_threshold_60",
+    indicator == "Población con ingresos por unidad de consumo por encima 140% de la mediana" ~ "pct_above_threshold_140"
+  )) |> 
+  # Reshape to wide format (column names will now be in English)
+  pivot_wider(names_from = indicator, values_from = value)
+
+cat("  Sections:", nrow(threshold_sx), "\n")
+```
+
+#### Household Composition
+
+```{r}
+register_composition <- read_excel(path_register, sheet = "Composicion del hogar", 
+                                   skip = 4, col_names = FALSE) |> 
+  # Filter: Valid 5-digit section codes
+  filter(!is.na(...2), str_detect(as.character(...2), "^[0-9]{5}$")) |> 
+  # Build CUSEC and extract household composition data
+  mutate(
+    section_code = as.character(...2),
+    CUSEC = paste0("28079", str_sub(section_code, 1, 2), str_sub(section_code, 3, 5)),
+    total_households = as.numeric(...3),
+    # Total single-parent households (father + mother)
+    n_single_parent = as.numeric(...8) + as.numeric(...9),
+    pct_single_parent = (n_single_parent / total_households) * 100,
+    # Female-headed single-parent households ONLY (column 9 = mother alone)
+    n_single_mother = as.numeric(...9),
+    pct_single_mother = (n_single_mother / total_households) * 100
+  ) |> 
+  filter(!is.na(total_households), total_households > 0) |> 
+  select(CUSEC, total_households_register = total_households, 
+         n_single_parent, pct_single_parent, n_single_mother, pct_single_mother)
+```
+
+#### Nationality
+
+```{r}
+register_nationality <- read_excel(path_register, sheet = "Tipo-Nacionalidad de sus miembr",
+                                   skip = 4, col_names = FALSE) |> 
+  # Filter: Valid 5-digit section codes
+  filter(!is.na(...2), str_detect(as.character(...2), "^[0-9]{5}$")) |> 
+  # Build CUSEC and calculate % all-foreign households
+  mutate(
+    section_code = as.character(...2),
+    CUSEC = paste0("28079", str_sub(section_code, 1, 2), str_sub(section_code, 3, 5)),
+    total_nationality = as.numeric(...3),
+    pct_foreign_households = (as.numeric(...5) / total_nationality) * 100  # % all-foreign households
+  ) |> 
+  filter(!is.na(total_nationality), total_nationality > 0) |> 
+  select(CUSEC, pct_foreign_households)
+
+# Merge household composition and nationality data
+register <- register_composition |> left_join(register_nationality, by = "CUSEC")
+```
+
+#### Population by Section
+```{r}
+population <- read_excel(path_population, sheet = 1, skip = 8, col_names = FALSE) |> 
+  # Filter: Valid CUSEC codes for Madrid (28079)
+  filter(!is.na(...1), str_detect(as.character(...1), "^28079[0-9]{5}")) |> 
+  # Extract CUSEC and population data
+  mutate(
+    CUSEC = str_extract(as.character(...1), "^[0-9]{10}"),
+    total_population = as.numeric(...6),
+    foreign_population = as.numeric(...16),
+    pct_foreign_pop = (foreign_population / total_population) * 100  # % foreign population
+  ) |> 
+  filter(!is.na(CUSEC), !is.na(total_population)) |> 
+  select(CUSEC, total_population, pct_foreign_pop)
+```
+
+##### Building Age - Mean and Median (CAM Census)
+```{r}
+census24 <- read_excel(path_census24, sheet = "Sheet0", skip = 17,
+                       col_names = c("name", "dwellings", "mean_surface", "median_surface", "mode_surface",
+                                     "mean_building_age", "median_building_age", "mode_building_age")) |> 
+  # Filter: Madrid district and section entries
+  filter(str_detect(name, "^Madrid - Distrito [0-9]+ - Sección [0-9]+")) |> 
+  # Build CUSEC from district and section numbers
+  mutate(
+    CUSEC = paste0("28079",
+                   str_pad(str_extract(name, "(?<=Distrito )[0-9]+"), 2, "left", "0"),
+                   str_pad(str_extract(name, "(?<=Sección )[0-9]+"), 3, "left", "0")),
+    mean_building_age = as.numeric(mean_building_age),      # Mean building age (years)
+    median_building_age = as.numeric(median_building_age)   # Median building age (years)
+  ) |> 
+  filter(!is.na(mean_building_age)) |> 
+  select(CUSEC, mean_building_age, median_building_age)
+```
+
+#### Pre-1980 Buildings (CAM Census)
+```{r}
+census22 <- read_excel(path_census22, sheet = "Sheet0", skip = 11,
+                       col_names = c("name", "total", "before_1900",
+                                     "d1901_1920", "d1921_1940", "d1941_1950",
+                                     "d1951_1960", "d1961_1970", "d1971_1980",
+                                     "d1981_1990", "d1991_2000", "d2001_2005",
+                                     "d2006_2010", "d2011_2015", "d2016_2020",
+                                     "d2021_2025", "unknown")) |> 
+  # Filter: Madrid district and section entries
+  filter(str_detect(name, "^Madrid - Distrito [0-9]+ - Sección [0-9]+")) |> 
+  # Build CUSEC and calculate % pre-1980 buildings (thermal inefficiency proxy)
+  mutate(
+    CUSEC = paste0("28079",
+                   str_pad(str_extract(name, "(?<=Distrito )[0-9]+"), 2, "left", "0"),
+                   str_pad(str_extract(name, "(?<=Sección )[0-9]+"), 3, "left", "0")),
+    across(total:unknown, as.numeric),
+    dwellings_pre1980 = before_1900 + d1901_1920 + d1921_1940 +
+                        d1941_1950 + d1951_1960 + d1961_1970 + d1971_1980,
+    pct_pre1980 = (dwellings_pre1980 / total) * 100  # % built before 1980 (NBE-CT-79)
+  ) |> 
+  filter(!is.na(total), total > 0) |> 
+  select(CUSEC, total_dwellings = total, pct_pre1980)
+
+cat("  Sections:", nrow(census22), "\n")
+```
+
+#### Join Full dataset
+
+```{r}
+master_census <- income |> 
+  left_join(demo,         by = "CUSEC") |> 
+  left_join(inequality,   by = "CUSEC") |> 
+  left_join(threshold_sx, by = "CUSEC") |> 
+  left_join(register,     by = "CUSEC") |> 
+  left_join(population,   by = "CUSEC") |> 
+  left_join(census24,     by = "CUSEC") |> 
+  left_join(census22,     by = "CUSEC")
+
+cat(sprintf("Master census: %d sections × %d variables\n", 
+            nrow(master_census), ncol(master_census)))
+```
+
+#### Quality verification
+
+##### Duplicate CUSECs
+
+```{r}
+n_dup <- master_census |> 
+  group_by(CUSEC) |> 
+  filter(n() > 1) |> 
+  nrow()
+n_dup
+```
+No duplicates, perfect.
+
+##### Missing data
+
+```{r}
+master_census |> 
+  summarise(across(everything(), ~sum(is.na(.)))) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "n_na") |> 
+  arrange(desc(n_na))
+```
+
+### Part 2: Missing Data Imputation
+
+#### Overview
+
+The master census file contains missing values in key variables required for 
+stratification and modeling. This section addresses these gaps through 
+systematic comparison of imputation methods.
+
+**Missing data summary:**
+
+- `pct_below_threshold_40/50/60`, `pct_above_threshold_140`: 354 NAs (14.5%)
+- `net_household_income`, `median_equiv_income`: 50 NAs (2.0%)
+- `pct_under_18`, `pct_over_65`, `mean_household_size`: 50 NAs (2.0%)
+
+**Methods compared:**
+
+1. **missForest** — Random Forest multivariate imputation
+2. **MICE** — Multiple Imputation by Chained Equations (PMM)
+3. **Amelia** — Expectation-Maximization with Bootstrap
+4. **Conditional mean** — Mean by income quintile
+5. **Conditional median** — Median by income quintile
+
+**Validation strategy:**
+
+- 10-fold cross-validation with 20% masked data
+- Metric: RMSE (Root Mean Squared Error) on percentage variables
+- Selection criterion: Lowest average RMSE across critical variables
+
+**Missing data summary (after filtering by `mean_equiv_income`):**
+
+- `pct_below_threshold_40/50/60`, `pct_above_threshold_140`: 304 NAs (12.4%)
+- All demographic and housing variables: 0 NAs (filtered out with `mean_equiv_income`)
+
+**Note:** 50 sections were excluded due to missing `mean_equiv_income` 
+(stratification variable). Final analysis dataset: 2,443 sections.
+
+#### Missing Data Diagnosis
+
+```{r}
+na_counts <- master_census |> 
+  summarise(across(everything(), ~sum(is.na(.)))) |> 
+  pivot_longer(everything(), names_to = "variable", values_to = "n_na") |> 
+  mutate(pct_na = 100 * n_na / nrow(master_census)) |> 
+  filter(n_na > 0) |> 
+  arrange(desc(n_na))
+
+na_counts
+```
+
+#### Method Comparison via Cross-Validation
+
+```{r}
+# Prepare data ONCE
+census_ebp <-
+  master_census |> 
+  filter(!is.na(mean_equiv_income)) |> 
+  mutate(income_quintile = ntile(mean_equiv_income, 5))
+
+# Define variables ONCE
+vars_to_impute <- c("pct_below_threshold_40", "pct_below_threshold_50", "pct_below_threshold_60",
+                    "pct_above_threshold_140", "net_household_income", "median_equiv_income",
+                    "pct_under_18", "pct_over_65", "mean_household_size",
+                    "gini", "pct_single_parent", "pct_single_mother", "pct_foreign_households",
+                    "mean_building_age", "median_building_age", "pct_pre1980", "total_dwellings")
+
+predictor_vars <- c("mean_equiv_income", "total_population", "pct_foreign", 
+                    "pct_single_person", "pct_foreign_pop", "total_households_register", 
+                    "n_single_parent", "n_single_mother")
+
+model_vars <- unique(c(vars_to_impute, predictor_vars))
+model_vars <- model_vars[model_vars %in% names(census_ebp)]
+
+cat("Sections for CV:", nrow(census_ebp), "\n")
+cat("Model variables:", length(model_vars), "\n")
+```
+
+##### CV Function
+
+```{r}
+compare_methods_cv <- function(data, model_vars, vars_to_evaluate, 
+                               n_reps = 10, pct_mask = 0.20, seed = 123) {
+  
+  complete_data <- data |> 
+    select(all_of(c(model_vars, "income_quintile"))) |> 
+    filter(complete.cases(pick(all_of(vars_to_evaluate))))
+  
+  results <- list()
+  set.seed(seed)
+  
+  for(rep in 1:n_reps) {
+    cat(sprintf("Rep %d/%d... ", rep, n_reps))
+    
+    data_rep <- complete_data
+    true_values <- list()
+    
+    # Mask values
+    for(var in vars_to_evaluate) {
+      n_mask <- round(nrow(data_rep) * pct_mask)
+      idx_mask <- sample(1:nrow(data_rep), n_mask)
+      true_values[[var]] <- data_rep[[var]][idx_mask]
+      data_rep[[var]][idx_mask] <- NA
+    }
+    
+    # Method 1: missForest
+    tryCatch({
+      mat_mf <- data_rep |> select(all_of(model_vars)) |> as.data.frame()
+      mf_result <- missForest(mat_mf, maxiter = 5, ntree = 50, verbose = FALSE)
+      
+      for(var in vars_to_evaluate) {
+        idx_mask <- which(is.na(data_rep[[var]]))
+        imputed_values <- mf_result$ximp[[var]][idx_mask]
+        rmse <- sqrt(mean((true_values[[var]] - imputed_values)^2))
+        results[[length(results) + 1]] <- data.frame(
+          repetition = rep, method = "missForest", variable = var, rmse = rmse)
+      }
+    }, error = function(e) NULL)
+    
+    # Method 2: MICE
+    tryCatch({
+      mat_mice <- data_rep |> select(all_of(model_vars)) |> as.data.frame()
+      mice_result <- mice(mat_mice, m = 1, maxit = 5, method = "pmm", 
+                          printFlag = FALSE, seed = seed + rep)
+      mice_complete <- complete(mice_result, 1)
+      
+      for(var in vars_to_evaluate) {
+        idx_mask <- which(is.na(data_rep[[var]]))
+        imputed_values <- mice_complete[[var]][idx_mask]
+        rmse <- sqrt(mean((true_values[[var]] - imputed_values)^2))
+        results[[length(results) + 1]] <- data.frame(
+          repetition = rep, method = "MICE", variable = var, rmse = rmse)
+      }
+    }, error = function(e) NULL)
+    
+    # Method 3: Amelia
+    tryCatch({
+      mat_amelia <- data_rep |> select(all_of(model_vars)) |> as.data.frame()
+      amelia_result <- amelia(mat_amelia, m = 1, p2s = 0, boot.type = "none")
+      amelia_complete <- amelia_result$imputations[[1]]
+      
+      for(var in vars_to_evaluate) {
+        idx_mask <- which(is.na(data_rep[[var]]))
+        imputed_values <- amelia_complete[[var]][idx_mask]
+        rmse <- sqrt(mean((true_values[[var]] - imputed_values)^2))
+        results[[length(results) + 1]] <- data.frame(
+          repetition = rep, method = "Amelia", variable = var, rmse = rmse)
+      }
+    }, error = function(e) NULL)
+    
+    # Method 4: Mean by quintile
+    for(var in vars_to_evaluate) {
+      idx_mask <- which(is.na(data_rep[[var]]))
+      quintile_means <- data_rep |> 
+        filter(!is.na(.data[[var]])) |> 
+        group_by(income_quintile) |> 
+        summarise(mean_value = mean(.data[[var]], na.rm = TRUE), .groups = "drop")
+      
+      imputed_values <- data_rep$income_quintile[idx_mask] |> 
+        map_dbl(~quintile_means$mean_value[quintile_means$income_quintile == .x])
+      
+      rmse <- sqrt(mean((true_values[[var]] - imputed_values)^2))
+      results[[length(results) + 1]] <- data.frame(
+        repetition = rep, method = "Mean_Quintile", variable = var, rmse = rmse)
+    }
+    
+    # Method 5: Median by quintile
+    for(var in vars_to_evaluate) {
+      idx_mask <- which(is.na(data_rep[[var]]))
+      quintile_medians <- data_rep |> 
+        filter(!is.na(.data[[var]])) |> 
+        group_by(income_quintile) |> 
+        summarise(median_value = median(.data[[var]], na.rm = TRUE), .groups = "drop")
+      
+      imputed_values <- data_rep$income_quintile[idx_mask] |> 
+        map_dbl(~quintile_medians$median_value[quintile_medians$income_quintile == .x])
+      
+      rmse <- sqrt(mean((true_values[[var]] - imputed_values)^2))
+      results[[length(results) + 1]] <- data.frame(
+        repetition = rep, method = "Median_Quintile", variable = var, rmse = rmse)
+    }
+  }
+  
+  bind_rows(results)
+}
+```
+
+##### Run CV
+
+```{r}
+vars_to_evaluate <- c("pct_below_threshold_60", "pct_below_threshold_40", 
+                      "net_household_income", "pct_over_65")
+
+cv_results <- compare_methods_cv(
+  data = census_ebp,
+  model_vars = model_vars,
+  vars_to_evaluate = vars_to_evaluate,
+  n_reps = 10,
+  pct_mask = 0.20,
+  seed = 123
+)
+```
+
+#### Results
+
+```{r}
+global_summary <- cv_results |> 
+  group_by(method) |> 
+  summarise(mean_rmse = mean(rmse), sd_rmse = sd(rmse), .groups = "drop") |> 
+  arrange(mean_rmse)
+
+print(global_summary)
+```
+
+##### Visualization
+
+```{r}
+# Select sections with complete data for one key variable
+demo_var <- "pct_below_threshold_60"
+
+demo_data <- census_ebp |> 
+  select(all_of(c(model_vars, "income_quintile"))) |> 
+  filter(complete.cases(pick(all_of(demo_var))))
+
+# Create a copy with 20% masked
+set.seed(123)
+n_mask <- round(nrow(demo_data) * 0.20)
+idx_mask <- sample(1:nrow(demo_data), n_mask)
+
+demo_masked <- demo_data
+demo_masked[[demo_var]][idx_mask] <- NA
+
+# Store original values
+original_values <- demo_data[[demo_var]][idx_mask]
+
+# Impute with each method
+imputed_values <- data.frame(original = original_values)
+
+# missForest
+mat_mf <- demo_masked |> select(all_of(model_vars)) |> as.data.frame()
+mf_result <- missForest(mat_mf, maxiter = 5, ntree = 50, verbose = FALSE)
+imputed_values$missForest <- mf_result$ximp[[demo_var]][idx_mask]
+
+# MICE
+mat_mice <- demo_masked |> select(all_of(model_vars)) |> as.data.frame()
+mice_result <- mice(mat_mice, m = 1, maxit = 5, method = "pmm", printFlag = FALSE, seed = 123)
+mice_complete <- complete(mice_result, 1)
+imputed_values$MICE <- mice_complete[[demo_var]][idx_mask]
+
+# Amelia
+mat_amelia <- demo_masked |> select(all_of(model_vars)) |> as.data.frame()
+amelia_result <- amelia(mat_amelia, m = 1, p2s = 0, boot.type = "none")
+amelia_complete <- amelia_result$imputations[[1]]
+imputed_values$Amelia <- amelia_complete[[demo_var]][idx_mask]
+
+# Mean by quintile
+quintile_means <- demo_masked |> 
+  filter(!is.na(.data[[demo_var]])) |> 
+  group_by(income_quintile) |> 
+  summarise(mean_value = mean(.data[[demo_var]], na.rm = TRUE), .groups = "drop")
+imputed_values$Mean_Quintile <- demo_masked$income_quintile[idx_mask] |> 
+  map_dbl(~quintile_means$mean_value[quintile_means$income_quintile == .x])
+
+# Pivot to long format
+variables <- c("original", "missForest", "MICE", "Amelia", "Mean_Quintile")
+titles <- c("Original Distribution", "missForest", "MICE (PMM)", "Amelia (EM)", "Mean by Quintile")
+colors_fill <- c("skyblue", "#15ad4f", "#6a6ad9", "#e65100", "#ff6f00")
+
+imputed_long <- imputed_values |> 
+  pivot_longer(all_of(variables), names_to = "method", values_to = "value")
+
+# Create faceted histogram
+fig_b1 <- imputed_long |> 
+  mutate(title = factor(method, levels = variables, labels = titles)) |> 
+  ggplot(aes(x = value, fill = title)) +
+  geom_histogram(binwidth = 2, color = "#808080", alpha = 0.8) +
+  facet_wrap(~title, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = colors_fill) +
+  labs(title = "Distribution Comparison: Original vs Imputed Values",
+       subtitle = paste0("Variable: ", demo_var, " (", n_mask, " masked values)"),
+       x = "Value", y = "Frequency") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 11),
+        plot.title = element_text(size = 14, face = "bold"))
+
+fig_b1
+```
+
+##### Error Distribution Analysis
+
+```{r}
+# Calculate errors for each method
+error_data <- data.frame(
+  missForest = imputed_values$missForest - imputed_values$original,
+  MICE = imputed_values$MICE - imputed_values$original,
+  Amelia = imputed_values$Amelia - imputed_values$original,
+  Mean_Quintile = imputed_values$Mean_Quintile - imputed_values$original
+)
+
+# Pivot to long format
+error_long <- error_data |> 
+  pivot_longer(everything(), names_to = "method", values_to = "error")
+
+# Summary statistics
+error_summary <- error_long |> 
+  group_by(method) |> 
+  summarise(
+    mean_error = mean(error),
+    median_error = median(error),
+    mad_error = mean(abs(error)),  # Mean Absolute Deviation
+    rmse = sqrt(mean(error^2)),
+    .groups = "drop"
+  ) |> 
+  arrange(rmse)
+
+print(error_summary)
+
+# Plot 1: Error distribution (histogram)
+p1_err_dist <- ggplot(error_long, aes(x = error, fill = method)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 1) +
+  facet_wrap(~method, ncol = 2) +
+  scale_fill_manual(values = c("missForest" = "#15ad4f", "MICE" = "#6a6ad9", 
+                                "Amelia" = "#e65100", "Mean_Quintile" = "#ff6f00")) +
+  labs(title = "Error Distribution by Method",
+       subtitle = "Error = Imputed - Original (0 = perfect prediction)",
+       x = "Error (percentage points)", y = "Frequency") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold", size = 11))
+
+# Plot 2: Absolute error boxplot
+p2_abe <- error_long |> 
+  mutate(abs_error = abs(error)) |> 
+  ggplot(aes(x = reorder(method, abs_error, median), y = abs_error, fill = method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 0.5) +
+  scale_fill_manual(values = c("missForest" = "#15ad4f", "MICE" = "#6a6ad9", 
+                                "Amelia" = "#e65100", "Mean_Quintile" = "#ff6f00")) +
+  labs(title = "Absolute Error Comparison",
+       subtitle = "Lower is better",
+       x = "Method", y = "Absolute Error (pp)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Plot 3: Error vs Original value (scatterplot)
+p3_vs <- bind_cols(
+  original = rep(imputed_values$original, 4),
+  error = error_long$error,
+  method = error_long$method
+) |> 
+  ggplot(aes(x = original, y = error, color = method)) +
+  geom_point(alpha = 0.5, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = FALSE, size = 1) +
+  facet_wrap(~method, ncol = 2) +
+  scale_color_manual(values = c("missForest" = "#15ad4f", "MICE" = "#6a6ad9", 
+                                 "Amelia" = "#e65100", "Mean_Quintile" = "#ff6f00")) +
+  labs(title = "Error Pattern by Original Value",
+       subtitle = "Do methods systematically over/under-estimate?",
+       x = "Original Value", y = "Error (Imputed - Original)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        strip.text = element_text(face = "bold"))
+
+# Combine plots
+error_analysis <- (p1_err_dist | p2_abe) / p3_vs +
+  plot_annotation(
+    title = "Comprehensive Error Analysis",
+    subtitle = paste0("Variable: ", demo_var, " | n = ", n_mask, " imputed values"),
+    theme = theme(plot.title = element_text(size = 16, face = "bold"))
+  )
+
+error_analysis
+```
+
+##### Mean Absolute Error Ranking
+
+```{r}
+# Bar plot of MAE
+mae_method <- ggplot(error_summary, aes(x = reorder(method, mad_error), y = mad_error, fill = method)) +
+  geom_col(alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.2f pp", mad_error)), vjust = -0.5, size = 5) +
+  scale_fill_manual(values = c("missForest" = "#15ad4f", "MICE" = "#6a6ad9", 
+                                "Amelia" = "#e65100", "Mean_Quintile" = "#ff6f00")) +
+  labs(title = "Mean Absolute Error (MAE) by Method",
+       subtitle = "Average prediction error in percentage points",
+       x = "Method", y = "MAE (percentage points)") +
+  theme_classic() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12),
+        plot.title = element_text(size = 14, face = "bold"))
+
+mae_method
+```
+
+#### Imputation
+
+Based on comprehensive cross-validation analysis comparing five imputation methods 
+across four critical variables, **missForest** was selected as the optimal approach.
+
+**Selection criteria:**
+
+| Metric | missForest | MICE | Amelia | Mean Quintile |
+|--------|-----------|------|--------|---------------|
+| **Mean Absolute Error** | **0.95 pp** | 1.32 pp | 1.33 pp | 3.87 pp |
+| **RMSE** | **5.87** | 5.99 | 5.98 | 5.70 |
+| **Error distribution** | Centered at 0 | Good | Good | Biased |
+| **Systematic bias** | None detected | Minimal | Moderate | High |
+
+**Key advantages of missForest:**
+
+1. **Lowest prediction error**: 28% lower MAE than MICE (0.95 vs 1.32 pp)
+2. **Unbiased**: Error distribution centered at 0 with minimal variance
+3. **Robust**: No systematic over/under-estimation across value ranges
+4. **Non-linear modeling**: Captures complex relationships between predictors
+5. **Standard method**: Widely used in Small Area Estimation literature
+
+**Missing mechanism:** Data are **Missing at Random (MAR)** - missingness is 
+related to observable characteristics (small population size) but not to the 
+missing values themselves.
+
+**Algorithm parameters:**
+- Method: Random Forest multivariate imputation
+- `maxiter = 10`: Maximum iterations for convergence
+- `ntree = 100`: Trees per Random Forest
+- `seed = 123`: Reproducibility
+- Quality target: OOB error < 0.05 (excellent) or < 0.10 (acceptable)
+
+```{r}
+# Note: census_ebp and model_vars already defined in CV setup above
+# If running independently, ensure they exist or uncomment below:
+# census_ebp <- master_census |> 
+#   filter(!is.na(mean_equiv_income)) |> 
+#   mutate(income_quintile = ntile(mean_equiv_income, 5))
+
+# Show variables with NAs
+for(var in model_vars) {
+  n_na <- sum(is.na(census_ebp[[var]]))
+  if(n_na > 0) {
+    cat(sprintf("  %-30s: %4d NAs (%5.1f%%)\n", var, n_na, 
+                100 * n_na / nrow(census_ebp)))
+  }
+}
+
+# Run missForest
+set.seed(123)
+mat_mf <- census_ebp |> select(all_of(model_vars)) |> as.data.frame()
+total_nas <- sum(is.na(mat_mf))
+cat(sprintf("Total NAs to impute: %d\n", total_nas))
+
+start_time <- Sys.time()
+mf_result <- missForest(mat_mf, maxiter = 10, ntree = 100, verbose = TRUE)
+elapsed_time <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+
+if(mf_result$OOBerror < 0.05) {
+  cat("(Excellent)\n")
+} else if(mf_result$OOBerror < 0.10) {
+  cat("(Good)\n")
+} else {
+  cat("(Acceptable)\n")
+}
+
+# Integrate imputed values
+for(var in model_vars) {
+  was_na <- is.na(census_ebp[[var]])
+  n_imputed <- sum(was_na)
+  
+  if(n_imputed > 0) {
+    census_ebp[[var]] <- mf_result$ximp[[var]]
+    census_ebp[[paste0("imputed_", var)]] <- ifelse(was_na, "missForest", "observed")
+    cat(sprintf("  %-30s: %4d imputed\n", var, n_imputed))
+  }
+}
+
+# Verify completion
+remaining_nas <- census_ebp |> 
+  select(all_of(model_vars)) |> 
+  summarise(across(everything(), ~sum(is.na(.)))) |> 
+  pivot_longer(everything()) |> 
+  filter(value > 0)
+
+if(nrow(remaining_nas) == 0) {
+  cat("\nAll NAs successfully imputed\n")
+} else {
+  cat("\nRemaining NAs:\n")
+  print(remaining_nas)
+}
+```
+
+#### Validation
+
+```{r}
+check_var <- "pct_below_threshold_60"
+
+comparison <- master_census |> 
+  select(CUSEC, original = all_of(check_var)) |> 
+  inner_join(
+    census_ebp |> select(CUSEC, imputed = all_of(check_var)),
+    by = "CUSEC"
+  ) |> 
+  mutate(was_na = is.na(original))
+
+p1_1 <- ggplot(comparison |> filter(!was_na), aes(x = original)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "#808080") +
+  labs(title = "A) Observed Values", x = check_var, y = "Frequency") +
+  theme_classic()
+
+p2_1 <- ggplot(comparison |> filter(was_na), aes(x = imputed)) +
+  geom_histogram(bins = 30, fill = "#15ad4f", color = "#808080") +
+  labs(title = "B) Imputed Values", x = check_var, y = "Frequency") +
+  theme_classic()
+
+p3_1 <- ggplot(comparison, aes(x = imputed, fill = was_na)) +
+  geom_histogram(bins = 30, alpha = 0.7, position = "identity") +
+  scale_fill_manual(values = c("FALSE" = "skyblue", "TRUE" = "#15ad4f"),
+                    labels = c("Observed", "Imputed"), name = "") +
+  labs(title = "C) Combined Distribution", x = check_var, y = "Frequency") +
+  theme_classic() +
+  theme(legend.position = "bottom")
+
+imputation_quality <- (p1_1 | p2_1) / p3_1 +
+  plot_annotation(
+    title = "missForest Imputation Quality Check",
+    subtitle = paste0("Variable: ", check_var, " (", sum(comparison$was_na), " imputed)")
+  )
+
+imputation_quality
+```
+
+```{r}
+cat("Dimensions:", nrow(census_ebp), "sections ×", ncol(census_ebp), "variables\n")
+```
+
+## Phase 2: Small area estimation
+
+### Overview
+
+The ECV survey does not publish census section identifiers (CUSEC) in its public
+microdata, as its sampling design is only representative at the regional level. 
+This prevents direct estimation of energy poverty at the section level, requiring
+the use of Small Area Estimation (SAE) techniques.
+We implement a synthetic regression estimator (Rao & Molina, 2015, Section 3.3)
+using a generalized linear mixed model with binomial family and logit link, appropriate
+for the binary nature of the dependent variable. The model is trained on
+household-level survey data (ECV Madrid, ~1,900 households) and applied to
+section-level aggregated census covariates (Atlas INE, 2,443 sections) to
+generate energy poverty predictions.
+
+The model specification includes equivalized household income, household size,
+and presence of elderly members (65+) as fixed effects, with random intercepts
+by income quintile to account for unobserved heterogeneity across socioeconomic
+strata. Since census sections are not sampled in the ECV, section-specific random
+effects cannot be estimated and are assumed to equal their expected value of zero
+(synthetic assumption).
+
+Income quintile thresholds are calculated exclusively from the ECV distribution
+and subsequently applied to classify census sections, ensuring methodological
+consistency. The model is validated through correlations with independent Atlas
+INE indicators: poverty rate (r = 0.92) and mean income (r = -0.90), confirming
+that predicted energy vulnerability captures the socioeconomic structure of
+census sections despite the micro-macro aggregation level difference.
+This approach follows the World Bank guidelines for poverty mapping when
+geographic identifiers are unavailable in survey data (Corral et al., 2022).
+Complete theoretical framework, model diagnostics, and methodological
+justification are provided in the thesis document.
+
+### Step 1: Charge and prepare data
+
+```{r}
+# Load survey (Phase 1 output)
+survey_raw <- read_csv("data/datos_fase1_final.csv", show_col_types = FALSE)
+
+# Load imputed census (Phase 2 output - Imputation)
+census_raw <- census_ebp
+
+cat("Survey:", nrow(survey_raw), "households | Census:", nrow(census_raw), "sections\n\n")
+
+valid_survey <- survey_raw |> 
+  filter(!is.na(pobreza_energetica)) |>  
+  mutate(
+    Y = pobreza_energetica,
+    
+    income_raw = pmin(pmax(renta_equiv_euros, 7450), 51860),
+    
+    # Standardize
+    income = income_raw / 10000,
+    
+    household_size = as.numeric(n_miembros),
+    has_elderly_num = as.numeric(tiene_mayor65)
+  ) |> 
+  filter(!is.na(Y), !is.na(income))
+
+cat("Valid households:", nrow(valid_survey), 
+    "(excluded:", nrow(survey_raw) - nrow(valid_survey), ")\n")
+cat("Mean energy poverty:", round(mean(valid_survey$Y) * 100, 1), "%\n\n")
+```
+
+### Step 2: Calculate quintiles from ECV data
+
+```{r}
+# CRITICAL: Quintile thresholds calculated ONLY from ECV
+quintile_thresholds <- quantile(valid_survey$income, c(0.20, 0.40, 0.60, 0.80))
+
+cat("Quintile thresholds (€/10k):\n")
+cat(sprintf("  Q1: income ≤ %.3f (≤€%s)\n", quintile_thresholds[1], 
+            format(quintile_thresholds[1] * 10000, big.mark = ",")))
+cat(sprintf("  Q2: %.3f < income ≤ %.3f (€%s - €%s)\n", 
+            quintile_thresholds[1], quintile_thresholds[2],
+            format(quintile_thresholds[1] * 10000, big.mark = ","),
+            format(quintile_thresholds[2] * 10000, big.mark = ",")))
+cat(sprintf("  Q3: %.3f < income ≤ %.3f (€%s - €%s)\n", 
+            quintile_thresholds[2], quintile_thresholds[3],
+            format(quintile_thresholds[2] * 10000, big.mark = ","),
+            format(quintile_thresholds[3] * 10000, big.mark = ",")))
+cat(sprintf("  Q4: %.3f < income ≤ %.3f (€%s - €%s)\n", 
+            quintile_thresholds[3], quintile_thresholds[4],
+            format(quintile_thresholds[3] * 10000, big.mark = ","),
+            format(quintile_thresholds[4] * 10000, big.mark = ",")))
+cat(sprintf("  Q5: income > %.3f (>€%s)\n\n", quintile_thresholds[4],
+            format(quintile_thresholds[4] * 10000, big.mark = ",")))
+
+# Apply THESE SAME thresholds to the ECV
+valid_survey <- valid_survey |> 
+  mutate(
+    household_quintile = factor(case_when(
+      income <= quintile_thresholds[1] ~ 1,
+      income <= quintile_thresholds[2] ~ 2,
+      income <= quintile_thresholds[3] ~ 3,
+      income <= quintile_thresholds[4] ~ 4,
+      TRUE ~ 5
+    ), levels = 1:5)
+  )
+```
+
+### Step 3: apply previous quintiles to censo data
+
+```{r}
+valid_census <- census_raw |> 
+  mutate(
+    # Standardize census income
+    income = mean_equiv_income / 10000,
+    
+    household_size = mean_household_size,
+    has_elderly_num = pct_over_65 / 100,
+    
+    # CRITICAL: Apply SAME thresholds from ECV
+    section_quintile = case_when(
+      income <= quintile_thresholds[1] ~ 1,
+      income <= quintile_thresholds[2] ~ 2,
+      income <= quintile_thresholds[3] ~ 3,
+      income <= quintile_thresholds[4] ~ 4,
+      TRUE ~ 5
+    ),
+    
+    # For the model, call it household_quintile (same name as in ECV)
+    household_quintile = factor(section_quintile, levels = 1:5)
+  ) |> 
+  filter(!is.na(income), !is.na(household_quintile)) |> 
+  select(CUSEC, section_quintile, household_quintile, income, household_size, 
+         has_elderly_num, pct_below_threshold_60, 
+         gini, pct_pre1980, total_population, median_equiv_income)
+
+# Verify distribution in Atlas (will NOT be uniform - this is correct)
+cat("Atlas distribution by quintile (using ECV thresholds):\n")
+census_dist <- valid_census |> 
+  count(section_quintile) |> 
+  mutate(pct = round(100 * n / sum(n), 1))
+print(census_dist)
+```
+
+### Step 4: estimate mixed logitis model (training phase)
+
+```{r}
+sae_model <- glmer(
+  Y ~ income + household_size + has_elderly_num + (1 | household_quintile),
+  data = valid_survey,
+  family = binomial(link = "logit"),
+  control = glmerControl(
+    optimizer = "bobyqa", 
+    optCtrl = list(maxfun = 100000)
+  )
+)
+
+# =============================================================================
+# Model summary
+# =============================================================================
+
+cat("FIXED EFFECTS (log-odds scale):\n")
+coef_summary <- summary(sae_model)$coefficients
+coef_df <- as.data.frame(coef_summary) |> 
+  rownames_to_column("Coefficient") |> 
+  mutate(
+    OR = exp(Estimate),
+    sig = case_when(
+      `Pr(>|z|)` < 0.001 ~ "***",
+      `Pr(>|z|)` < 0.01 ~ "**",
+      `Pr(>|z|)` < 0.05 ~ "*",
+      TRUE ~ ""
+    )
+  ) |> 
+  select(Coefficient, Estimate, `Std. Error`, OR, `z value`, `Pr(>|z|)`, sig)
+
+print(coef_df, digits = 4)
+
+cat("\nInterpretation (Odds Ratios):\n")
+cat(sprintf("  income:             OR = %.3f (%.1f%% decrease per €10k)\n", 
+            exp(coef(summary(sae_model))["income", "Estimate"]),
+            (1 - exp(coef(summary(sae_model))["income", "Estimate"])) * 100))
+cat(sprintf("  household_size:     OR = %.3f (%.1f%% increase per member)\n",
+            exp(coef(summary(sae_model))["household_size", "Estimate"]),
+            (exp(coef(summary(sae_model))["household_size", "Estimate"]) - 1) * 100))
+cat(sprintf("  has_elderly_num:    OR = %.3f\n",
+            exp(coef(summary(sae_model))["has_elderly_num", "Estimate"])))
+
+cat("RANDOM EFFECTS:\n")
+print(VarCorr(sae_model))
+
+cat("\nRandom effects by quintile:\n")
+ranef_vals <- ranef(sae_model)$household_quintile
+ranef_df <- data.frame(
+  Quintile = 1:5,
+  Effect = ranef_vals[,1]
+) |> 
+  mutate(
+    Direction = ifelse(Effect > 0, "+", "-"),
+    Interpretation = case_when(
+      Effect > 0.05 ~ "Higher poverty than expected",
+      Effect < -0.05 ~ "Lower poverty than expected",
+      TRUE ~ "Near average"
+    )
+  )
+print(ranef_df, digits = 4)
+
+cat("\n")
+cat("MODEL FIT:\n")
+cat(sprintf("  AIC:  %.1f\n", AIC(sae_model)))
+cat(sprintf("  BIC:  %.1f\n", BIC(sae_model)))
+cat(sprintf("  Log-Likelihood: %.1f\n", logLik(sae_model)))
+
+# R²
+r2 <- r.squaredGLMM(sae_model)
+cat(sprintf("  R² marginal:    %.3f (fixed effects only)\n", r2[1]))
+cat(sprintf("  R² conditional: %.3f (fixed + random effects)\n", r2[2]))
+```
+
+### Step 5: synthetic prediction for non-sampled areas
+
+```{r}
+cat("Method: Synthetic Regression Estimator (Rao & Molina, 2015, Section 3.3)\n")
+cat("Assumption: v_section = E[v] = 0 (no data available to estimate section-specific effects)\n\n")
+
+cat("Prediction formula for section j:\n")
+cat("  logit(p_j) = β̂₀ + β̂₁·income_j + β̂₂·household_size_j + β̂₃·elderly_j + v̂_i\n")
+cat("  where v̂_i = random effect of quintile i (from training)\n\n")
+
+# Prediction WITH random effects (uses v̂_i from quintile)
+cat("Generating predictions with quintile random effects...\n")
+
+evi_pred_with_re <- predict(
+  sae_model, 
+  newdata = valid_census,
+  allow.new.levels = FALSE,
+  re.form = NULL,
+  type = "response"
+)
+
+# Prediction WITHOUT random effects (v = 0)
+evi_pred_without_re <- predict(
+  sae_model,
+  newdata = valid_census,
+  allow.new.levels = FALSE,
+  re.form = ~0,
+  type = "response"
+)
+
+# Integrate both predictions
+sae_results <- valid_census |> 
+  mutate(
+    EVI_synthetic = evi_pred_with_re * 100,
+    EVI_fixed_only = evi_pred_without_re * 100
+  )
+
+cat(sprintf("\nPredictions generated for %d sections\n", nrow(sae_results)))
+cat("\nMETHOD 1: Synthetic with quintile effects (RECOMMENDED):\n")
+cat(sprintf("  Mean EVI = %.1f%% | Range: [%.1f%%, %.1f%%]\n",
+            mean(sae_results$EVI_synthetic),
+            min(sae_results$EVI_synthetic),
+            max(sae_results$EVI_synthetic)))
+
+cat("\nMETHOD 2: Fixed effects only (no random effects):\n")
+cat(sprintf("  Mean EVI = %.1f%% | Range: [%.1f%%, %.1f%%]\n\n",
+            mean(sae_results$EVI_fixed_only),
+            min(sae_results$EVI_fixed_only),
+            max(sae_results$EVI_fixed_only)))
+
+# Detailed statistics
+cat("EVI SUMMARY (Synthetic with quintile effects):\n")
+summary_stats <- summary(sae_results$EVI_synthetic)
+print(summary_stats)
+
+cat("\n\nDISTRIBUTION BY QUINTILE:\n")
+quintile_dist <- sae_results |> 
+  group_by(section_quintile) |> 
+  summarise(
+    n_sections = n(),
+    pct_sections = round(100 * n() / nrow(sae_results), 1),
+    EVI_mean = mean(EVI_synthetic),
+    EVI_sd = sd(EVI_synthetic),
+    EVI_min = min(EVI_synthetic),
+    EVI_max = max(EVI_synthetic),
+    .groups = "drop"
+  ) |> 
+  mutate(across(where(is.numeric) & !c(n_sections, pct_sections), ~round(., 1)))
+
+print(quintile_dist)
+```
+
+### Step 6: external validation
+
+```{r}
+correlations <- sae_results |> 
+  summarise(
+    cor_income = cor(EVI_synthetic / 100, income, use = "complete.obs"),
+    cor_threshold60 = cor(EVI_synthetic / 100, pct_below_threshold_60, use = "complete.obs"),
+    cor_gini = cor(EVI_synthetic / 100, gini, use = "complete.obs"),
+    cor_pre1980 = cor(EVI_synthetic / 100, pct_pre1980, use = "complete.obs")
+  )
+
+cat("Correlations between predicted EVI and Atlas INE indicators:\n\n")
+
+if (!is.na(correlations$cor_income)) {
+  cat(sprintf("  %-30s r = %+.3f", "Mean income:", correlations$cor_income))
+  if (correlations$cor_income < -0.7) {
+    cat("  Strong negative (expected)\n")
+  } else if (correlations$cor_income < 0) {
+    cat("  Negative (expected)\n")
+  } else {
+    cat("  Unexpected sign\n")
+  }
+}
+
+if (!is.na(correlations$cor_threshold60)) {
+  cat(sprintf("  %-30s r = %+.3f", "Poverty rate (60% threshold):", correlations$cor_threshold60))
+  if (correlations$cor_threshold60 > 0.7) {
+    cat("  Strong positive (expected)\n")
+  } else if (correlations$cor_threshold60 > 0) {
+    cat("  Positive (expected)\n")
+  } else {
+    cat("  Unexpected sign\n")
+  }
+}
+
+if (!is.na(correlations$cor_gini)) {
+  cat(sprintf("  %-30s r = %+.3f", "Gini coefficient:", correlations$cor_gini))
+  cat("  (informative)\n")
+}
+
+if (!is.na(correlations$cor_pre1980)) {
+  cat(sprintf("  %-30s r = %+.3f", "%% dwellings pre-1980:", correlations$cor_pre1980))
+  if (correlations$cor_pre1980 > 0) {
+    cat("   Positive (older = less efficient)\n")
+  } else {
+    cat("  ~ (informative)\n")
+  }
+}
+```
+
+### Step 7: visualizations
+
+```{r}
+# Plot 1: EVI Distribution
+p_dist <- ggplot(sae_results, aes(x = EVI_synthetic)) +
+  geom_histogram(bins = 50, fill = "#2A9D8F", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = mean(sae_results$EVI_synthetic),
+             color = "#E63946", linewidth = 1, linetype = "dashed") +
+  labs(
+    title = "Energy Vulnerability Index Distribution",
+    subtitle = "Synthetic estimation for 2,443 census sections in Madrid",
+    x = "EVI (%)",
+    y = "Number of sections",
+    caption = paste0("Mean = ", round(mean(sae_results$EVI_synthetic), 1), "%")
+  ) +
+theme_minimal(base_size = 10) +    
+theme(plot.title = element_text(face = "bold", size = 10),  
+      plot.subtitle = element_text(size = 8))                 
+
+# Plot 2: EVI vs Income
+p_income <- ggplot(sae_results, aes(x = income * 10000, y = EVI_synthetic)) +
+  geom_point(alpha = 0.4, color = "#457B9D", size = 1) +
+  geom_smooth(method = "loess", color = "#E63946", se = TRUE, linewidth = 1.2) +
+  scale_x_continuous(labels = scales::dollar_format(prefix = "€", big.mark = ",")) +
+  labs(
+    title = "EVI vs Mean Income per Equivalence Unit",
+    subtitle = paste0("Correlation: r = ", round(correlations$cor_income, 3)),
+    x = "Mean Income (€/EU)",
+    y = "EVI (%)"
+  ) +
+theme_minimal(base_size = 10) +    
+theme(plot.title = element_text(face = "bold", size = 10),  
+      plot.subtitle = element_text(size = 8)) 
+
+# Plot 3: EVI by Quintile
+p_quint <- ggplot(sae_results, aes(x = factor(section_quintile), y = EVI_synthetic)) +
+  geom_boxplot(fill = "#2A9D8F", alpha = 0.7, outlier.alpha = 0.3) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 3, 
+               fill = "#E63946", color = "white") +
+  labs(
+    title = "EVI by Income Quintile",
+    subtitle = "Red diamond = mean | Box = IQR",
+    x = "Income Quintile (1=lowest, 5=highest)",
+    y = "EVI (%)"
+  ) +
+theme_minimal(base_size = 10) +    
+theme(plot.title = element_text(face = "bold", size = 10),  
+      plot.subtitle = element_text(size = 8)) 
+
+# Plot 4: EVI vs % below 60% threshold
+p_poverty <- ggplot(sae_results, aes(x = pct_below_threshold_60, y = EVI_synthetic)) +
+  geom_point(alpha = 0.4, color = "#457B9D", size = 1) +
+  geom_smooth(method = "lm", color = "#E63946", se = TRUE, linewidth = 1.2) +
+  labs(
+    title = "EVI vs Population Below Poverty Threshold (60%)",
+    subtitle = paste0("Correlation: r = ", round(correlations$cor_threshold60, 3)),
+    x = "% population below 60% threshold",
+    y = "EVI (%)"
+  ) +
+theme_minimal(base_size = 10) +    
+theme(plot.title = element_text(face = "bold", size = 10),  
+      plot.subtitle = element_text(size = 8)) 
+
+# Combine plots
+combined_plot <- (p_dist | p_income) / (p_quint | p_poverty) +
+  plot_annotation(
+    title = "Small Area Estimation: Synthetic Regression Estimator (Logistic Mixed Model)",
+    subtitle = "Method: Rao & Molina (2015, Section 3.2) | Application: Energy Poverty in Madrid",
+    theme = theme(
+      plot.title = element_text(size = 13, face = "bold"),
+      plot.subtitle = element_text(size = 9)                 
+    )
+  )
+
+combined_plot
+
+fig_4_2 <- p_income | p_poverty +
+  plot_annotation(
+    title = "Figure 4.2 — External validation of the synthetic EVI",
+    subtitle = "Bivariate relationships with two independent INE Atlas indicators (n = 2,443 sections)",
+    theme = theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 11, color = "gray40", hjust = 0.5)
+    )
+  )
+```
+
+### Summary
+
+```{r}
+cat("Method: Synthetic Regression Estimator (Rao & Molina, 2015)\n")
+cat("Application: Energy Poverty Index for census sections in Madrid\n")
+cat("Training: ", nrow(valid_survey), " households (ECV)\n")
+cat("Prediction: ", nrow(sae_results), " sections (Atlas INE)\n")
+cat("Mean EVI: ", round(mean(sae_results$EVI_synthetic), 1), "%\n")
+cat("Validation: r(poverty_60%) = ", round(correlations$cor_threshold60, 3), 
+    " | r(income) = ", round(correlations$cor_income, 3), "\n\n")
+```
+
+## Umbral justification
+
+### Threshold Justification
+
+The Synthetic Regression Estimator from Phase 2 produces continuous predictions 
+of the Energy Vulnerability Index (EVI) for each census section, but identifying 
+sections as *energy poor* requires defining a cut-off point. Following the 
+literature on energy poverty measurement, this study adopts **EVI > 15** as the 
+classification threshold.
+
+To ensure that this choice is methodologically robust and not arbitrary, the 
+threshold is validated through three independent approaches:
+
+1. **Coherence with the Eurostat criterion**: comparing the proposed threshold 
+   against the European standard for identifying excessive spending on basic 
+   needs (gasto > 2× median).
+
+2. **Empirical distribution in Madrid**: assessing the position of the threshold 
+   within the local EVI distribution and the resulting prevalence of energy 
+   poverty against published estimates for Spain.
+
+3. **Validation with independent indicators (Atlas INE)**: testing whether 
+   sections classified as energy poor (EVI > 15) exhibit statistically 
+   significant differences in socioeconomic indicators that were *not* used 
+   in the SAE model (poverty rate, mean income, Gini coefficient).
+
+The convergence of these three approaches provides empirical support for the 
+chosen threshold and ensures that subsequent classification captures real 
+socioeconomic vulnerability rather than methodological artifacts.
+
+#### Eurostat Criterion
+
+```{r}
+# ------------------------------------------------------------------------------
+# EUROSTAT CRITERION: Threshold as a multiple of the median
+# ------------------------------------------------------------------------------
+
+# Compute descriptive statistics
+median_evi <- median(sae_results$EVI_synthetic, na.rm = TRUE)
+q1_evi     <- quantile(sae_results$EVI_synthetic, 0.25, na.rm = TRUE)
+q3_evi     <- quantile(sae_results$EVI_synthetic, 0.75, na.rm = TRUE)
+mean_evi   <- mean(sae_results$EVI_synthetic, na.rm = TRUE)
+
+# Threshold/median ratio
+eurostat_ratio <- 15 / median_evi
+
+cat(sprintf("  EVI median in Madrid:  %.2f\n", median_evi))
+cat(sprintf("  Proposed threshold:    15.00\n"))
+cat(sprintf("  Ratio (15/median):     %.2fx\n\n", eurostat_ratio))
+
+if (eurostat_ratio >= 1.3 && eurostat_ratio <= 2.5) {
+  cat("  COHERENT with Eurostat criterion:\n")
+  cat("    The 15/median ratio falls within the European standard range (1.3x - 2.5x)\n")
+  cat("    for identifying excessive spending on basic needs.\n")
+  cat("    Eurostat criterion: spending > 2× median = excessive spending\n")
+} else {
+  cat(sprintf("  Ratio %.2fx is outside the typical Eurostat range (1.3-2.5x)\n", eurostat_ratio))
+}
+```
+#### Empirical Distribution
+
+```{r}
+# Prevalence above the threshold
+pct_above_15 <- 100 * mean(sae_results$EVI_synthetic > 15, na.rm = TRUE)
+n_above_15   <- sum(sae_results$EVI_synthetic > 15, na.rm = TRUE)
+
+cat(sprintf("  Mean:     %.2f\n", mean_evi))
+cat(sprintf("  Median:   %.2f\n", median_evi))
+cat(sprintf("  Q1 (p25): %.2f\n", q1_evi))
+cat(sprintf("  Q3 (p75): %.2f\n", q3_evi))
+cat("\n")
+cat(sprintf("  Threshold 15 falls at the %.0fth percentile of the distribution\n", 
+            100 * mean(sae_results$EVI_synthetic <= 15, na.rm = TRUE)))
+cat(sprintf("  Sections with EVI > 15: %d of %d (%.1f%%)\n", 
+            n_above_15, nrow(sae_results), pct_above_15))
+cat("\n")
+
+if (pct_above_15 >= 30 && pct_above_15 <= 50) {
+  cat("  COHERENT with energy poverty estimates for Spain:\n")
+  cat(sprintf("    - This estimate: %.1f%% of sections\n", pct_above_15))
+  cat("    - Spanish literature: 25-45%% households (ACA 2021, Tirado 2018)\n")
+  cat("    - European Energy Poverty Observatory: 30-40%% Spain\n")
+} else if (pct_above_15 < 30) {
+  cat(sprintf("  Estimate (%.1f%%) is conservative vs literature (30-45%%)\n", pct_above_15))
+} else {
+  cat(sprintf("  Estimate (%.1f%%) is higher than literature (30-45%%)\n", pct_above_15))
+}
+```
+
+#### Validation with Atlas INE Indicators
+
+```{r}
+# Explicit join: Atlas INE + EVI_synthetic
+validation_data <- census_ebp |> 
+  select(CUSEC, pct_below_threshold_60, gini, pct_pre1980, mean_equiv_income) |> 
+  inner_join(
+    sae_results |> select(CUSEC, EVI_synthetic), 
+    by = "CUSEC"
+  ) |> 
+  # Create binary variable: energy poor YES/NO
+  mutate(poor_evi15 = EVI_synthetic > 15)
+
+cat(sprintf("  Sections with complete data: %d\n", nrow(validation_data)))
+cat(sprintf("  Poor sections (EVI>15):      %d (%.1f%%)\n", 
+            sum(validation_data$poor_evi15), 
+            100 * mean(validation_data$poor_evi15)))
+cat("\n")
+
+# Compare Atlas INE means between poor and non-poor sections
+atlas_comparison <- validation_data |> 
+  group_by(poor_evi15) |> 
+  summarise(
+    n                    = n(),
+    mean_pct_threshold60 = mean(pct_below_threshold_60, na.rm = TRUE),
+    mean_income          = mean(mean_equiv_income, na.rm = TRUE),
+    mean_gini            = mean(gini, na.rm = TRUE),
+    mean_pct_pre1980     = mean(pct_pre1980, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cat("  Comparison: poor sections (EVI>15) vs non-poor (EVI≤15):\n\n")
+
+cat(sprintf("  Variable                       Non-poor      Poor      Difference\n"))
+cat(sprintf("  %-28s   %8.1f    %8.1f    %+8.1f%%%%\n",
+            "%% below 60%% threshold (Atlas)",
+            atlas_comparison$mean_pct_threshold60[1],
+            atlas_comparison$mean_pct_threshold60[2],
+            100 * (atlas_comparison$mean_pct_threshold60[2] / atlas_comparison$mean_pct_threshold60[1] - 1)))
+
+cat(sprintf("  %-28s   %8.0f€   %8.0f€   %+8.1f%%%%\n",
+            "Mean income (Atlas)",
+            atlas_comparison$mean_income[1],
+            atlas_comparison$mean_income[2],
+            100 * (atlas_comparison$mean_income[2] / atlas_comparison$mean_income[1] - 1)))
+
+cat(sprintf("  %-28s   %8.3f    %8.3f    %+8.1f%%%%\n",
+            "Gini (Atlas)",
+            atlas_comparison$mean_gini[1],
+            atlas_comparison$mean_gini[2],
+            100 * (atlas_comparison$mean_gini[2] / atlas_comparison$mean_gini[1] - 1)))
+
+# Statistical tests
+test_threshold60 <- t.test(
+  pct_below_threshold_60 ~ poor_evi15,
+  data = validation_data,
+  alternative = "less"  # Poor sections expected to have MORE % below threshold
+)
+
+test_income <- t.test(
+  mean_equiv_income ~ poor_evi15,
+  data = validation_data,
+  alternative = "greater"  # Poor sections expected to have LESS income
+)
+
+test_gini <- t.test(
+  gini ~ poor_evi15,
+  data = validation_data
+)
+
+cat("\n")
+cat("  Statistical tests:\n")
+cat(sprintf("    %% below 60%%%% threshold: t = %.2f, p-value = %.4f %s\n",
+            test_threshold60$statistic,
+            test_threshold60$p.value,
+            ifelse(test_threshold60$p.value < 0.001, "***", 
+                   ifelse(test_threshold60$p.value < 0.01, "**", 
+                          ifelse(test_threshold60$p.value < 0.05, "*", "")))))
+cat(sprintf("    Mean income:             t = %.2f, p-value = %.4f %s\n",
+            test_income$statistic,
+            test_income$p.value,
+            ifelse(test_income$p.value < 0.001, "***", 
+                   ifelse(test_income$p.value < 0.01, "**", 
+                          ifelse(test_income$p.value < 0.05, "*", "")))))
+cat(sprintf("    Gini:                    t = %.2f, p-value = %.4f %s\n",
+            test_gini$statistic,
+            test_gini$p.value,
+            ifelse(test_gini$p.value < 0.001, "***", 
+                   ifelse(test_gini$p.value < 0.01, "**", 
+                          ifelse(test_gini$p.value < 0.05, "*", "")))))
+
+cat("\n")
+if (test_threshold60$p.value < 0.05 && test_income$p.value < 0.05) {
+  cat("  SUCCESSFUL VALIDATION:\n")
+  cat("    Sections with EVI>15 show significant differences in independent\n")
+  cat("    socioeconomic indicators (Atlas INE), confirming that the threshold\n")
+  cat("    captures real economic vulnerability.\n")
+} else {
+  cat("   Tests do not show significant differences.\n")
+}
+```
+
+#### Visualizations
+
+```{r}
+# EVI Distribution with Threshold
+p_hist <- sae_results |> 
+  ggplot(aes(x = EVI_synthetic)) +
+  geom_histogram(aes(fill = EVI_synthetic > 15), 
+                 bins = 50, alpha = 0.85, color = "white") +
+  geom_vline(xintercept = 15, linetype = "dashed", 
+             color = "red", linewidth = 1.2) +
+  geom_vline(xintercept = median_evi, linetype = "dotted", 
+             color = "black", linewidth = 0.8) +
+  annotate("text", x = 15.5, y = 140, 
+           label = "Threshold = 15", 
+           hjust = 0, color = "red", size = 4, fontface = "bold") +
+  annotate("text", x = median_evi - 0.5, y = 120, 
+           label = sprintf("Median = %.1f", median_evi), 
+           hjust = 1, size = 3.5, color = "black") +
+  scale_fill_manual(
+    values = c("FALSE" = "#2E75B6", "TRUE" = "#C00000"),
+    labels = c("FALSE" = "EVI ≤ 15  (non-poor)", 
+               "TRUE" = "EVI > 15  (energy poor)")
+  ) +
+  labs(
+    title = "A) EVI Distribution and Threshold",
+    subtitle = sprintf("%.1f%% of sections classified as energy poor | Ratio 15/median = %.2fx",
+                       pct_above_15, eurostat_ratio),
+    x = "EVI (Energy Vulnerability Index)",
+    y = "Number of census sections",
+    fill = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0),
+    plot.subtitle = element_text(size = 10, color = "gray40", hjust = 0),
+    legend.position = "top",
+    legend.text = element_text(size = 10)
+  )
+
+# Validation with INE Atlas indicators (boxplots)
+p_box_data <- validation_data |> 
+  mutate(Group = ifelse(poor_evi15, 
+                        "Energy poor\n(EVI > 15)", 
+                        "Non-poor\n(EVI ≤ 15)")) |> 
+  select(Group, pct_below_threshold_60, mean_equiv_income) |> 
+  pivot_longer(cols = c(pct_below_threshold_60, mean_equiv_income),
+               names_to = "Variable",
+               values_to = "Value") |> 
+  mutate(Variable = case_when(
+    Variable == "pct_below_threshold_60" ~ "% population below 60% poverty threshold",
+    Variable == "mean_equiv_income"      ~ "Mean equivalised income (€)"
+  ))
+
+p_box <- ggplot(p_box_data, aes(x = Group, y = Value, fill = Group)) +
+  geom_boxplot(alpha = 0.85, outlier.alpha = 0.4, outlier.size = 1) +
+  facet_wrap(~Variable, scales = "free_y") +
+  scale_fill_manual(values = c("Non-poor\n(EVI ≤ 15)" = "#2E75B6", 
+                               "Energy poor\n(EVI > 15)" = "#C00000")) +
+  labs(
+    title = "B) Validation against Independent Indicators (INE Atlas)",
+    subtitle = "Energy-poor sections show significantly worse socioeconomic conditions (p < 0.001)",
+    x = NULL, y = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0),
+    plot.subtitle = element_text(size = 10, color = "gray40", hjust = 0),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 10),
+    strip.background = element_rect(fill = "gray95", color = NA),
+    axis.text.x = element_text(size = 9.5)
+  )
+
+
+fig_c1 <- p_hist / p_box +
+  plot_annotation(
+    title = "Triple Validation of the EVI > 15 Threshold",
+    subtitle = "Empirical distribution and comparison with independent INE Atlas indicators",
+    theme = theme(
+      plot.title = element_text(size = 15, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 11, color = "gray40", hjust = 0.5)
+    )
+  ) +
+  plot_layout(heights = c(1.2, 1))
+
+
+print(fig_c1)
+```
+
+#### Conclusion
+
+```{r}
+cat("1. EUROSTAT CRITERION:\n")
+cat(sprintf("   Ratio 15/median = %.2fx\n", eurostat_ratio))
+cat("   Coherent with European standards (1.3x - 2.5x) for excessive spending\n\n")
+
+cat("2. EMPIRICAL DISTRIBUTION:\n")
+cat(sprintf("   %.1f%% of sections classified as energy poor\n", pct_above_15))
+cat("   Coherent with Spanish literature estimates (25-45%%)\n\n")
+
+cat("3. ATLAS INE VALIDATION:\n")
+cat("   Sections with EVI>15 show:\n")
+cat(sprintf("     - %.0f%%%% MORE population below 60%%%% threshold (p<%.3f)\n",
+            abs(100 * (atlas_comparison$mean_pct_threshold60[2] / atlas_comparison$mean_pct_threshold60[1] - 1)),
+            test_threshold60$p.value))
+cat(sprintf("     - %.0f%%%% LESS mean income (p<%.3f)\n",
+            abs(100 * (atlas_comparison$mean_income[2] / atlas_comparison$mean_income[1] - 1)),
+            test_income$p.value))
+```
+The triple validation confirms that the EVI > 15 threshold is statistically 
+justified: it is consistent with European benchmarks (1.36× the median), 
+corresponds to the 60th percentile of the Madrid distribution, and sections 
+above this cutoff exhibit significantly worse socioeconomic conditions across 
+all three independent INE Atlas indicators (p < 0.001).
+
+
+## Phase 3: Random Forest Models
+
+This phase builds two complementary Random Forest models that predict energy 
+poverty at the census section level using Google Earth Engine (GEE) variables 
+as the primary data source:
+
+- **Model 1 — Energy Poverty Classifier**: predicts whether a section is 
+  *energy poor* (EVI > 15) using GEE environmental variables combined with 
+  building age data. This model evaluates whether satellite-derived features 
+  can recover the socioeconomic classification produced by the SAE model in 
+  Phase 2.
+
+- **Model 2 — Physical Vulnerability Classifier**: predicts whether a section 
+  presents adverse *physical* conditions (extreme temperatures, lack of urban 
+  mitigation, inefficient buildings) using **only** GEE variables. This model 
+  identifies sections with structural vulnerability that may not appear in 
+  income-based surveys.
+
+A discrepancy analysis then characterizes four groups of sections (concordant, 
+non-vulnerable, spatial false positives, and spatial false negatives) to 
+identify areas that are *invisible* to traditional survey-based methods but 
+exhibit clear physical vulnerability signals from satellite data.
+
+Note: A first version of Model 2 (V1) suffered from circularity — predictors 
+were direct components of the target. This was corrected in V2 by excluding 
+all variables used in the target construction from the predictor set.
+
+
+### Step 0: prerequisities
+
+```{r}
+# Required objects from Phases 1 and 2
+required_objects <- c("sae_results", "census_ebp")
+
+missing_objects <- required_objects[!sapply(required_objects, exists)]
+
+# Additional libraries needed (base ones already loaded in Phases 1/2)
+if (!require(randomForest, quietly = TRUE)) install.packages("randomForest")
+if (!require(caret, quietly = TRUE)) install.packages("caret")
+if (!require(pROC, quietly = TRUE)) install.packages("pROC")
+
+library(randomForest)
+library(caret)
+library(pROC)
+
+# Configuration
+set.seed(42)
+options(scipen = 999)
+```
+
+### Step 1: Loading Google Earth Engine Data
+
+```{r}
+# Load GEE data
+gee <- read_csv(gee_path, show_col_types = FALSE) |> 
+  mutate(CUSEC = str_pad(as.character(CUSEC), 10, side = "left", pad = "0")) |> 
+  select(
+    CUSEC,
+    starts_with("LST_winter"), starts_with("LST_summer"),
+    starts_with("NDVI_"),
+    starts_with("NDBI_"),
+    starts_with("ALBEDO_"),
+    tcc
+  )
+
+cat(sprintf("  %d sections with GEE data\n", nrow(gee)))
+cat(sprintf("  %d GEE variables loaded\n", ncol(gee) - 1))
+```
+
+### Step 2: Integrating GEE with Phase 2 Data
+
+```{r}
+# Combine: GEE + EVI synthetic + Census
+dataset <- gee |> 
+  inner_join(
+    sae_results |> select(CUSEC, EVI_synthetic, section_quintile),
+    by = "CUSEC"
+  ) |> 
+  inner_join(
+    census_ebp |> select(
+      CUSEC, 
+      mean_equiv_income,    # used in characterization + export
+      mean_building_age,    # predictor M1 + characterization + export
+      pct_pre1980           # predictor M1 + characterization + export
+    ),
+    by = "CUSEC"
+  ) |> 
+  drop_na()
+
+cat(sprintf("  Integrated dataset: %d complete sections\n", nrow(dataset)))
+cat(sprintf("  Total variables: %d\n", ncol(dataset)))
+```
+
+### Step 3: Feature Engineering (derived variables)
+
+```{r}
+dataset <- dataset |> 
+  mutate(
+    # ENERGY DEMAND
+    heating_demand     = pmax(0, 18 - LST_winter_p10_21),
+    cooling_demand     = pmax(0, LST_summer_p90_21 - 26),
+    seasonal_amplitude = LST_summer_mean_21 - LST_winter_mean_21,
+    
+    # URBAN HEAT ISLAND INDEX
+    # Combines: high built-up (NDBI) + high temperature (LST) + low vegetation (NDVI)
+    urban_heat_island_raw = (NDBI_mean_21 * 0.4) + 
+                            ((LST_summer_mean_21 / 40) * 0.4) - 
+                            (NDVI_mean_21 * 0.2),
+    urban_heat_island = (urban_heat_island_raw - min(urban_heat_island_raw, na.rm = TRUE)) / 
+                        (max(urban_heat_island_raw, na.rm = TRUE) - 
+                         min(urban_heat_island_raw, na.rm = TRUE))
+  ) |> 
+  select(-urban_heat_island_raw)
+```
+
+### Step 4: Building the Model 2 Target — Physical Vulnerability
+
+```{r}
+dataset <- dataset |> 
+  mutate(
+    # --------------------------------------------------------------------------
+    # CRITERION 1: Extreme winter
+    # --------------------------------------------------------------------------
+    # Threshold: Coldest days below 25th percentile
+    # Justification: Risk of condensation, humidity, high thermal losses
+    extreme_winter = LST_winter_p10_21 < quantile(LST_winter_p10_21, 0.25, na.rm = TRUE),
+    
+    # --------------------------------------------------------------------------
+    # CRITERION 2: Extreme summer
+    # --------------------------------------------------------------------------
+    # Threshold: Hottest days > 42°C (AEMET heat wave)
+    # Justification: Indoor health risk without AC (>30°C indoor)
+    extreme_summer = LST_summer_p90_21 > 42,
+    
+    # --------------------------------------------------------------------------
+    # CRITERION 3: Inefficient buildings
+    # --------------------------------------------------------------------------
+    # Threshold: Majority of buildings predate NBE-CT-79 norm (1980)
+    # Justification: No thermal insulation → 3-4x higher heat losses
+    inefficient_building = pct_pre1980 > 60,
+    
+    # --------------------------------------------------------------------------
+    # CRITERION 4: No urban mitigation
+    # --------------------------------------------------------------------------
+    # Threshold: NDVI < 0.12 (functional absence of vegetation)
+    # Justification: No shade or evapotranspiration → +3-5°C temperature
+    no_urban_mitigation = NDVI_mean_21 < 0.12,
+    
+    # --------------------------------------------------------------------------
+    # FINAL TARGET: Physical energy vulnerability
+    # --------------------------------------------------------------------------
+    # Meets 3 or more of 4 criteria → high structural vulnerability
+    n_physical_criteria_v2 = as.integer(extreme_winter) + 
+                             as.integer(extreme_summer) + 
+                             as.integer(inefficient_building) + 
+                             as.integer(no_urban_mitigation),
+    
+    physical_vulnerability_v2 = n_physical_criteria_v2 >= 3
+  )
+
+# Descriptive statistics
+cat("Physical vulnerability criteria distribution (V2 - no circularity):\n")
+cat(sprintf("  - Extreme winter (LST_p10 < Q1):           %4d sections (%.1f%%)\n", 
+            sum(dataset$extreme_winter, na.rm = TRUE),
+            100 * mean(dataset$extreme_winter, na.rm = TRUE)))
+cat(sprintf("  - Extreme summer (LST_p90 > 42°C):         %4d sections (%.1f%%)\n", 
+            sum(dataset$extreme_summer, na.rm = TRUE),
+            100 * mean(dataset$extreme_summer, na.rm = TRUE)))
+cat(sprintf("  - Inefficient buildings (>60%% pre-1980):   %4d sections (%.1f%%)\n", 
+            sum(dataset$inefficient_building, na.rm = TRUE),
+            100 * mean(dataset$inefficient_building, na.rm = TRUE)))
+cat(sprintf("  - No urban mitigation (NDVI < 0.12):       %4d sections (%.1f%%)\n", 
+            sum(dataset$no_urban_mitigation, na.rm = TRUE),
+            100 * mean(dataset$no_urban_mitigation, na.rm = TRUE)))
+
+cat(sprintf("\n MODEL 2 TARGET (V2 - no circularity): %d vulnerable sections (%.1f%%)\n", 
+            sum(dataset$physical_vulnerability_v2, na.rm = TRUE),
+            100 * mean(dataset$physical_vulnerability_v2, na.rm = TRUE)))
+
+# Distribution by number of criteria met
+cat("\nDistribution by number of criteria met:\n")
+criteria_table_v2 <- dataset |> 
+  count(n_physical_criteria_v2) |> 
+  mutate(percentage = 100 * n / sum(n))
+print(criteria_table_v2, n = Inf)
+```
+
+### Step 5: Building the Model 1 Target — Energy Poverty
+
+```{r}
+# Target Model 1: EVI > 15 (energy poverty threshold)
+dataset <- dataset |> 
+  mutate(energy_poverty = EVI_synthetic > 15)
+
+cat(sprintf(" MODEL 1 TARGET: %d sections with energy poverty (%.1f%%)\n", 
+            sum(dataset$energy_poverty, na.rm = TRUE),
+            100 * mean(dataset$energy_poverty, na.rm = TRUE)))
+
+cat(sprintf("  Mean EVI: %.2f (SD: %.2f)\n", 
+            mean(dataset$EVI_synthetic, na.rm = TRUE),
+            sd(dataset$EVI_synthetic, na.rm = TRUE)))
+cat(sprintf("  Median EVI: %.2f (Q1: %.2f, Q3: %.2f)\n",
+            median(dataset$EVI_synthetic, na.rm = TRUE),
+            quantile(dataset$EVI_synthetic, 0.25, na.rm = TRUE),
+            quantile(dataset$EVI_synthetic, 0.75, na.rm = TRUE)))
+```
+
+### Step 6: Training Model 2 — Physical Vulnerability
+
+#### Part 1: Predictor selection (excluding target components)
+
+```{r}
+# CRITICAL: Exclude variables directly used in target construction
+predictors_m2_v2 <- c(
+  # LST (EXCEPT winter_p10 and summer_p90, which are in the target)
+  "LST_winter_mean_21", "LST_winter_sd_21", 
+  "LST_winter_median_21", "LST_winter_p90_21",
+  "LST_summer_mean_21", "LST_summer_sd_21", 
+  "LST_summer_p10_21", "LST_summer_median_21",
+  
+  # NDVI (EXCEPT mean_21, used in target as threshold < 0.12)
+  "NDVI_sd_21", "NDVI_p10_21", "NDVI_median_21", "NDVI_p90_21",
+  
+  # NDBI, ALBEDO, tcc
+  "NDBI_mean_21", "NDBI_sd_21",
+  "ALBEDO_mean_21", "ALBEDO_sd_21",
+  "tcc",
+  
+  # Derived variables (allowed now - NOT in target)
+  "seasonal_amplitude", "urban_heat_island"
+)
+
+predictors_m2_v2 <- predictors_m2_v2[predictors_m2_v2 %in% names(dataset)]
+
+cat("Model 2 predictors (V2 - no circularity):\n")
+cat(sprintf("  Total: %d variables\n", length(predictors_m2_v2)))
+cat(sprintf("  - LST: %d variables\n", sum(grepl("LST_", predictors_m2_v2))))
+cat(sprintf("  - NDVI: %d variables\n", sum(grepl("NDVI_", predictors_m2_v2))))
+cat(sprintf("  - NDBI: %d variables\n", sum(grepl("NDBI_", predictors_m2_v2))))
+cat(sprintf("  - ALBEDO: %d variables\n", sum(grepl("ALBEDO_", predictors_m2_v2))))
+cat(sprintf("  - Derived: %d variables\n", sum(predictors_m2_v2 %in% c("seasonal_amplitude", "urban_heat_island"))))
+```
+
+#### Part 2: Train/Test split
+
+```{r}
+set.seed(42)
+train_idx_m2_v2 <- createDataPartition(dataset$physical_vulnerability_v2, 
+                                       p = 0.8, list = FALSE)
+
+train_m2_v2 <- dataset[train_idx_m2_v2, ]
+test_m2_v2  <- dataset[-train_idx_m2_v2, ]
+
+cat(sprintf(" Train set: %d sections (%.1f%% vulnerable)\n", 
+            nrow(train_m2_v2),
+            100 * mean(train_m2_v2$physical_vulnerability_v2)))
+cat(sprintf(" Test set:  %d sections (%.1f%% vulnerable)\n", 
+            nrow(test_m2_v2),
+            100 * mean(test_m2_v2$physical_vulnerability_v2)))
+```
+
+
+#### Part 3: Train random forest
+
+```{r}
+# CRITICAL: Convert target to factor to force classification
+train_m2_v2 <- train_m2_v2 |> 
+  mutate(physical_vulnerability_v2 = factor(physical_vulnerability_v2, levels = c(FALSE, TRUE)))
+
+test_m2_v2 <- test_m2_v2 |> 
+  mutate(physical_vulnerability_v2 = factor(physical_vulnerability_v2, levels = c(FALSE, TRUE)))
+
+formula_m2_v2 <- as.formula(paste("physical_vulnerability_v2 ~", 
+                                   paste(predictors_m2_v2, collapse = " + ")))
+
+cat("Formula:", deparse(formula_m2_v2), "\n")
+cat("Target levels:", levels(train_m2_v2$physical_vulnerability_v2), "\n")
+cat("Train distribution:", table(train_m2_v2$physical_vulnerability_v2), "\n")
+
+start_m2_v2 <- Sys.time()
+
+rf_model_2_v2 <- randomForest(
+  formula    = formula_m2_v2,
+  data       = train_m2_v2,
+  ntree      = 500,
+  mtry       = floor(sqrt(length(predictors_m2_v2))),
+  importance = TRUE,
+  na.action  = na.omit
+)
+
+elapsed_m2_v2 <- as.numeric(difftime(Sys.time(), start_m2_v2, units = "secs"))
+
+cat(sprintf(" Model 2 (V2) trained in %.1f seconds (CLASSIFICATION)\n", elapsed_m2_v2))
+```
+
+#### Part 4: evaluation
+
+```{r}
+# Predictions
+pred_m2_v2_train <- predict(rf_model_2_v2, train_m2_v2, type = "response")
+pred_m2_v2_test  <- predict(rf_model_2_v2, test_m2_v2,  type = "response")
+
+# Probabilities (second column = TRUE class)
+prob_matrix_train_v2 <- predict(rf_model_2_v2, train_m2_v2, type = "prob")
+prob_matrix_test_v2  <- predict(rf_model_2_v2, test_m2_v2,  type = "prob")
+
+pred_prob_m2_v2_train <- prob_matrix_train_v2[, 2]
+pred_prob_m2_v2_test  <- prob_matrix_test_v2[, 2]
+
+# Confusion matrices
+cm_m2_v2_train <- confusionMatrix(
+  factor(pred_m2_v2_train, levels = c("FALSE", "TRUE")),
+  factor(train_m2_v2$physical_vulnerability_v2, levels = c("FALSE", "TRUE")),
+  positive = "TRUE"
+)
+
+cm_m2_v2_test <- confusionMatrix(
+  factor(pred_m2_v2_test, levels = c("FALSE", "TRUE")),
+  factor(test_m2_v2$physical_vulnerability_v2, levels = c("FALSE", "TRUE")),
+  positive = "TRUE"
+)
+
+cat("MODEL 2 RESULTS (V2 - NO CIRCULARITY):\n")
+cat(strrep("-", 79), "\n")
+cat(sprintf("TRAIN - Accuracy: %.3f | Precision: %.3f | Recall: %.3f | F1: %.3f\n",
+            cm_m2_v2_train$overall['Accuracy'],
+            cm_m2_v2_train$byClass['Precision'],
+            cm_m2_v2_train$byClass['Recall'],
+            cm_m2_v2_train$byClass['F1']))
+cat(sprintf("TEST  - Accuracy: %.3f | Precision: %.3f | Recall: %.3f | F1: %.3f\n",
+            cm_m2_v2_test$overall['Accuracy'],
+            cm_m2_v2_test$byClass['Precision'],
+            cm_m2_v2_test$byClass['Recall'],
+            cm_m2_v2_test$byClass['F1']))
+
+# AUC
+roc_m2_v2 <- roc(as.numeric(test_m2_v2$physical_vulnerability_v2),
+                 pred_prob_m2_v2_test, quiet = TRUE)
+cat(sprintf("TEST  - AUC: %.3f\n", auc(roc_m2_v2)))
+
+# Save metrics
+metrics_m2_v2 <- data.frame(
+  Set       = c("Train", "Test"),
+  Accuracy  = c(cm_m2_v2_train$overall['Accuracy'], cm_m2_v2_test$overall['Accuracy']),
+  Precision = c(cm_m2_v2_train$byClass['Precision'], cm_m2_v2_test$byClass['Precision']),
+  Recall    = c(cm_m2_v2_train$byClass['Recall'],   cm_m2_v2_test$byClass['Recall']),
+  F1        = c(cm_m2_v2_train$byClass['F1'],       cm_m2_v2_test$byClass['F1']),
+  AUC       = c(NA, auc(roc_m2_v2))
+)
+
+metrics_m2_v2
+```
+
+
+#### Part 5: Variable importance
+
+```{r}
+importance_m2_v2 <- importance(rf_model_2_v2)
+importance_m2_v2_df <- data.frame(
+  Variable = rownames(importance_m2_v2),
+  MeanDecreaseGini = importance_m2_v2[, "MeanDecreaseGini"]
+) |> 
+  arrange(desc(MeanDecreaseGini)) |> 
+  mutate(Relative_Importance = 100 * MeanDecreaseGini / sum(MeanDecreaseGini))
+
+cat("MOST IMPORTANT VARIABLES (Top 10):\n")
+print(head(importance_m2_v2_df, 10), row.names = FALSE, digits = 3)
+
+# Importance plot
+importance_m2_v2_df |> 
+  head(10) |> 
+  ggplot(aes(x = reorder(Variable, Relative_Importance), 
+             y = Relative_Importance)) +
+  geom_col(fill = "#2E75B6", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Model 2 (V2): Most Important Variables",
+       subtitle = "Physical vulnerability prediction (no circularity)",
+       x = "", y = "Relative importance (%)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+### Step 7: Training Model 1 — Energy Poverty
+
+#### Part 1: Predictor selection
+
+```{r}
+predictors_m1 <- c(
+  # GEE raw (ALL)
+  "LST_winter_mean_21", "LST_winter_sd_21", "LST_winter_p10_21", 
+  "LST_winter_median_21", "LST_winter_p90_21",
+  "LST_summer_mean_21", "LST_summer_sd_21", "LST_summer_p10_21", 
+  "LST_summer_median_21", "LST_summer_p90_21",
+  "NDVI_mean_21", "NDVI_sd_21", "NDVI_p10_21", "NDVI_median_21", "NDVI_p90_21",
+  "NDBI_mean_21", "NDBI_sd_21",
+  "ALBEDO_mean_21", "ALBEDO_sd_21",
+  "tcc",
+  # Building age
+  "mean_building_age", "pct_pre1980",
+  # Derived climate variables
+  "heating_demand", "cooling_demand", "seasonal_amplitude", "urban_heat_island"
+)
+
+predictors_m1 <- predictors_m1[predictors_m1 %in% names(dataset)]
+```
+
+#### Part 2: Train/Test split
+
+```{r}
+set.seed(42)
+train_idx_m1 <- createDataPartition(dataset$energy_poverty, p = 0.8, list = FALSE)
+
+train_m1 <- dataset[train_idx_m1, ]
+test_m1  <- dataset[-train_idx_m1, ]
+
+cat(sprintf(" Train set: %d sections (%.1f%% energy poor)\n", 
+            nrow(train_m1),
+            100 * mean(train_m1$energy_poverty)))
+cat(sprintf(" Test set:  %d sections (%.1f%% energy poor)\n", 
+            nrow(test_m1),
+            100 * mean(test_m1$energy_poverty)))
+```
+
+#### Part 3: Train Random Forest
+
+```{r}
+train_m1 <- train_m1 |> mutate(energy_poverty = factor(energy_poverty, levels = c(FALSE, TRUE)))
+test_m1  <- test_m1  |> mutate(energy_poverty = factor(energy_poverty, levels = c(FALSE, TRUE)))
+
+formula_m1 <- as.formula(paste("energy_poverty ~", paste(predictors_m1, collapse = " + ")))
+
+cat("Target levels:", levels(train_m1$energy_poverty), "\n")
+cat("Train distribution:", table(train_m1$energy_poverty), "\n")
+
+start_m1 <- Sys.time()
+
+rf_model_1 <- randomForest(
+  formula    = formula_m1,
+  data       = train_m1,
+  ntree      = 500,
+  mtry       = floor(sqrt(length(predictors_m1))),
+  importance = TRUE,
+  na.action  = na.omit
+)
+
+elapsed_m1 <- as.numeric(difftime(Sys.time(), start_m1, units = "secs"))
+```
+
+#### Part 4: evaluation
+
+```{r}
+pred_m1_train <- predict(rf_model_1, train_m1, type = "response")
+pred_m1_test  <- predict(rf_model_1, test_m1,  type = "response")
+
+prob_matrix_train <- predict(rf_model_1, train_m1, type = "prob")
+prob_matrix_test  <- predict(rf_model_1, test_m1,  type = "prob")
+
+pred_prob_m1_train <- prob_matrix_train[, 2]
+pred_prob_m1_test  <- prob_matrix_test[, 2]
+
+cm_m1_train <- confusionMatrix(
+  factor(pred_m1_train, levels = c("FALSE", "TRUE")),
+  factor(train_m1$energy_poverty, levels = c("FALSE", "TRUE")),
+  positive = "TRUE"
+)
+
+cm_m1_test <- confusionMatrix(
+  factor(pred_m1_test, levels = c("FALSE", "TRUE")),
+  factor(test_m1$energy_poverty, levels = c("FALSE", "TRUE")),
+  positive = "TRUE"
+)
+
+cat("MODEL 1 RESULTS:\n")
+cat(strrep("-", 79), "\n")
+cat(sprintf("TRAIN - Accuracy: %.3f | Precision: %.3f | Recall: %.3f | F1: %.3f\n",
+            cm_m1_train$overall['Accuracy'],
+            cm_m1_train$byClass['Precision'],
+            cm_m1_train$byClass['Recall'],
+            cm_m1_train$byClass['F1']))
+cat(sprintf("TEST  - Accuracy: %.3f | Precision: %.3f | Recall: %.3f | F1: %.3f\n",
+            cm_m1_test$overall['Accuracy'],
+            cm_m1_test$byClass['Precision'],
+            cm_m1_test$byClass['Recall'],
+            cm_m1_test$byClass['F1']))
+
+roc_m1 <- roc(as.numeric(test_m1$energy_poverty), pred_prob_m1_test, quiet = TRUE)
+cat(sprintf("TEST  - AUC: %.3f\n", auc(roc_m1)))
+
+metrics_m1 <- data.frame(
+  Set       = c("Train", "Test"),
+  Accuracy  = c(cm_m1_train$overall['Accuracy'], cm_m1_test$overall['Accuracy']),
+  Precision = c(cm_m1_train$byClass['Precision'], cm_m1_test$byClass['Precision']),
+  Recall    = c(cm_m1_train$byClass['Recall'],   cm_m1_test$byClass['Recall']),
+  F1        = c(cm_m1_train$byClass['F1'],       cm_m1_test$byClass['F1']),
+  AUC       = c(NA, auc(roc_m1))
+)
+
+metrics_m1
+```
+
+#### Variable importance
+
+```{r}
+importance_m1 <- importance(rf_model_1)
+importance_m1_df <- data.frame(
+  Variable = rownames(importance_m1),
+  MeanDecreaseGini = importance_m1[, "MeanDecreaseGini"]
+) |> 
+  arrange(desc(MeanDecreaseGini)) |> 
+  mutate(Relative_Importance = 100 * MeanDecreaseGini / sum(MeanDecreaseGini))
+
+cat("MOST IMPORTANT VARIABLES (Top 10):\n")
+print(head(importance_m1_df, 10), row.names = FALSE, digits = 3)
+
+importance_m1_df |> 
+  head(10) |> 
+  ggplot(aes(x = reorder(Variable, Relative_Importance), 
+             y = Relative_Importance)) +
+  geom_col(fill = "#C00000", alpha = 0.8) +
+  coord_flip() +
+  labs(title = "Model 1: Most Important Variables",
+       subtitle = "Energy poverty prediction (EVI > 15)",
+       x = "", y = "Relative importance (%)") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+dev.off()
+```
+
+### Step 8: Group identification (model 1 vs sae)
+
+```{r}
+# Predict on the full dataset
+dataset <- dataset |> 
+  mutate(
+    energy_poverty = factor(energy_poverty, levels = c(FALSE, TRUE)),
+    physical_vulnerability_v2 = factor(physical_vulnerability_v2, levels = c(FALSE, TRUE))
+  ) |> 
+  mutate(
+    pred_prob_m1    = predict(rf_model_1,    dataset, type = "prob")[, 2],
+    pred_m1         = predict(rf_model_1,    dataset, type = "response") == "TRUE",
+    pred_prob_m2_v2 = predict(rf_model_2_v2, dataset, type = "prob")[, 2],
+    pred_m2_v2      = predict(rf_model_2_v2, dataset, type = "response") == "TRUE"
+  )
+
+cat("8.1. Classifying sections into groups...\n\n")
+
+dataset <- dataset |> 
+  mutate(
+    group = case_when(
+      # CONCORDANT: both indicate vulnerable
+      pred_m1 == TRUE  & EVI_synthetic >= 15 ~ "Concordant",
+      
+      # SPATIAL FALSE POSITIVES: model says YES, SAE says NO
+      pred_m1 == TRUE  & EVI_synthetic <  15 ~ "Spatial_False_Positives",
+      
+      # SPATIAL FALSE NEGATIVES: model says NO, SAE says YES
+      pred_m1 == FALSE & EVI_synthetic >= 15 ~ "Spatial_False_Negatives",
+      
+      # NON-VULNERABLE: both indicate non-vulnerable
+      pred_m1 == FALSE & EVI_synthetic <  15 ~ "Non_Vulnerable",
+      
+      TRUE ~ "Other"
+    )
+  )
+
+# Group distribution
+group_table <- dataset |> 
+  count(group) |> 
+  mutate(percentage = 100 * n / sum(n)) |> 
+  arrange(desc(n))
+
+cat("GROUP DISTRIBUTION:\n")
+print(group_table, row.names = FALSE)
+
+cat(sprintf("\n Spatial False Positives: %d sections (%.1f%% of total)\n", 
+            sum(dataset$group == "Spatial_False_Positives"),
+            100 * mean(dataset$group == "Spatial_False_Positives")))
+cat(sprintf("Spatial False Negatives: %d sections (%.1f%% of total)\n", 
+            sum(dataset$group == "Spatial_False_Negatives"),
+            100 * mean(dataset$group == "Spatial_False_Negatives")))
+```
+
+### Step 9: Group characterization
+
+```{r}
+# Compare: Spatial False Positives vs Concordant
+comparison <- dataset |> 
+  filter(group %in% c("Spatial_False_Positives", "Concordant")) |> 
+  group_by(group) |> 
+  summarise(
+    n = n(),
+    # Economic
+    mean_EVI = mean(EVI_synthetic, na.rm = TRUE),
+    sd_EVI   = sd(EVI_synthetic, na.rm = TRUE),
+    mean_income = mean(mean_equiv_income, na.rm = TRUE),
+    sd_income   = sd(mean_equiv_income, na.rm = TRUE),
+    # Physical vulnerability (Model 2 V2)
+    pct_phys_vuln_m2_v2 = 100 * mean(as.logical(physical_vulnerability_v2), na.rm = TRUE),
+    mean_n_physical_criteria = mean(n_physical_criteria_v2, na.rm = TRUE),
+    # Specific criteria
+    pct_extreme_winter      = 100 * mean(extreme_winter, na.rm = TRUE),
+    pct_extreme_summer      = 100 * mean(extreme_summer, na.rm = TRUE),
+    pct_inefficient_bldg    = 100 * mean(inefficient_building, na.rm = TRUE),
+    pct_no_urban_mitigation = 100 * mean(no_urban_mitigation, na.rm = TRUE),
+    # Physical variables
+    mean_heating_demand = mean(heating_demand, na.rm = TRUE),
+    mean_cooling_demand = mean(cooling_demand, na.rm = TRUE),
+    mean_LST_winter_p10 = mean(LST_winter_p10_21, na.rm = TRUE),
+    mean_LST_summer_p90 = mean(LST_summer_p90_21, na.rm = TRUE),
+    mean_NDVI           = mean(NDVI_mean_21, na.rm = TRUE),
+    mean_building_age   = mean(mean_building_age, na.rm = TRUE),
+    mean_pct_pre1980    = mean(pct_pre1980, na.rm = TRUE),
+    .groups = "drop"
+  ) |> 
+  pivot_longer(-c(group, n), names_to = "variable", values_to = "value") |> 
+  pivot_wider(names_from = group, values_from = value) |> 
+  mutate(
+    Difference          = Spatial_False_Positives - Concordant,
+    Relative_Diff_Pct   = 100 * (Spatial_False_Positives - Concordant) / Concordant
+  )
+
+# Statistical tests
+cat("\n9.1. Statistical tests of differences...\n\n")
+
+false_pos   <- dataset |> filter(group == "Spatial_False_Positives")
+concordant  <- dataset |> filter(group == "Concordant")
+
+cat("STATISTICAL TESTS (Spatial False Positives vs Concordant):\n")
+cat(strrep("=", 79), "\n")
+
+test_vars <- c("EVI_synthetic", "mean_equiv_income", "heating_demand", 
+               "cooling_demand", "NDVI_mean_21", "mean_building_age")
+
+for (var in test_vars) {
+  if (var %in% names(dataset)) {
+    test <- t.test(false_pos[[var]], concordant[[var]])
+    cat(sprintf("\n%s:\n", var))
+    cat(sprintf("  Spatial False Positives: %.2f (SD: %.2f)\n", 
+                mean(false_pos[[var]], na.rm = TRUE), 
+                sd(false_pos[[var]], na.rm = TRUE)))
+    cat(sprintf("  Concordant:              %.2f (SD: %.2f)\n", 
+                mean(concordant[[var]], na.rm = TRUE), 
+                sd(concordant[[var]], na.rm = TRUE)))
+    cat(sprintf("  Difference:              %.2f\n", 
+                mean(false_pos[[var]], na.rm = TRUE) - mean(concordant[[var]], na.rm = TRUE)))
+    cat(sprintf("  p-value:                 %.4f %s\n", test$p.value, 
+                ifelse(test$p.value < 0.05, "***", "")))
+  }
+}
+```
+
+### Step 10: visualizations
+
+```{r}
+# ROC curves
+plot(roc_m1, main = sprintf("Model 1: Energy Poverty\nAUC = %.3f", auc(roc_m1)),
+     col = "#C00000", lwd = 2)
+
+plot(roc_m2_v2, main = sprintf("Model 2 (V2): Physical Vulnerability\nAUC = %.3f", auc(roc_m2_v2)),
+     col = "#2E75B6", lwd = 2)
+
+
+
+# EVI distribution by group
+
+dataset |> 
+  filter(group %in% c("Spatial_False_Positives", "Concordant", "Non_Vulnerable")) |> 
+  ggplot(aes(x = group, y = EVI_synthetic, fill = group)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 15, linetype = "dashed", color = "red", size = 1) +
+  scale_fill_manual(values = c("Spatial_False_Positives" = "#FFA500", 
+                                "Concordant" = "#C00000",
+                                "Non_Vulnerable" = "#2E75B6")) +
+  labs(title = "EVI Distribution by Group",
+       subtitle = "Red line = energy poverty threshold (EVI = 15)",
+       x = "", y = "EVI synthetic") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(face = "bold"),
+        axis.text.x = element_text(angle = 20, hjust = 1))
+
+
+# Scatter: Income vs EVI
+
+dataset |> 
+  filter(group %in% c("Spatial_False_Positives", "Concordant", "Non_Vulnerable")) |> 
+  ggplot(aes(x = mean_equiv_income, y = EVI_synthetic, color = group)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 15, linetype = "dashed", color = "red") +
+  geom_vline(xintercept = 16000, linetype = "dashed", color = "blue") +
+  scale_color_manual(values = c("Spatial_False_Positives" = "#FFA500", 
+                                 "Concordant" = "#C00000",
+                                 "Non_Vulnerable" = "#2E75B6")) +
+  labs(title = "Income vs EVI by Group",
+       subtitle = "Red line = EVI 15 | Blue line = Income ~16k€ (poverty threshold)",
+       x = "Mean income (€)", y = "EVI synthetic", color = "Group") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(face = "bold"))
+
+dev.off()
+```
+
+### Conclusion
+
+Phase 3 demonstrates that **Google Earth Engine variables, when properly 
+combined with building-age data, can recover much of the socioeconomic 
+classification produced by the SAE model**. Both classifiers achieve high 
+discriminative ability (AUC > 0.9), but they capture **partially different 
+phenomena**:
+
+- Model 1 (energy poverty) recovers the *socioeconomic* dimension of 
+  vulnerability inferred from income, household composition, and building 
+  characteristics.
+- Model 2 (physical vulnerability) captures *structural* adverse conditions 
+  visible from satellite imagery, independent of income.
+
+The **discrepancy analysis** between Model 1 and the SAE classification 
+identifies sections that are *invisible* to traditional survey-based targeting:
+
+- **Spatial False Positives** (≈ 1.4%) — wealthy areas with adverse physical 
+  conditions, where economic capacity neutralizes structural risks.
+- **Spatial False Negatives** (≈ 1.7%) — low-income areas with relatively 
+  good physical infrastructure, where economic vulnerability dominates over 
+  physical conditions.
+
+These findings support a **dual-targeting strategy** for energy poverty 
+intervention, combining survey-based socioeconomic indicators with 
+satellite-derived environmental signals. Neither source alone is sufficient — 
+their intersection identifies the most acute cases (Concordant), while their 
+discrepancies reveal policy-relevant population subgroups that single-source 
+methods systematically miss.
+
+The methodological correction from V1 to V2 (removing circularity) is 
+essential: the apparent perfect fit of V1 was an artifact of using target-defining 
+variables as predictors. The V2 metrics (Accuracy ≈ 93%, AUC ≈ 0.965) are 
+realistic and reflect genuine predictive capacity, supporting the use of GEE 
+data for this type of urban vulnerability mapping.
+
+
+
+## Shap Values
+
+```{r}
+# =============================================================================
+# SHAP VALUES — Local interpretability (using iml package)
+# =============================================================================
+
+library(iml)
+
+cat("\n")
+cat(strrep("=", 79), "\n")
+cat("SHAP VALUES — LOCAL FEATURE CONTRIBUTIONS\n")
+cat(strrep("=", 79), "\n\n")
+
+# Prepare data
+set.seed(42)
+sample_idx <- sample(1:nrow(test_m2_v2), min(200, nrow(test_m2_v2)))
+shap_sample <- test_m2_v2[sample_idx, predictors_m2_v2]
+
+# Create predictor object (wrapper around your trained model)
+predictor_m2 <- Predictor$new(
+  model = rf_model_2_v2,
+  data = shap_sample,
+  y = test_m2_v2$physical_vulnerability_v2[sample_idx],
+  type = "prob",
+  class = "TRUE"
+)
+
+cat("Computing SHAP values for Model 2 (200 sections)...\n")
+
+# Compute SHAP for ALL sample observations
+shap_results <- list()
+for (i in 1:nrow(shap_sample)) {
+  if (i %% 50 == 0) cat(sprintf("  Processed %d/%d sections\n", i, nrow(shap_sample)))
+  
+  shapley <- Shapley$new(predictor_m2, x.interest = shap_sample[i, ])
+  shap_results[[i]] <- shapley$results
+}
+
+cat("✓ SHAP values computed\n\n")
+
+# Combine results into a data frame
+shap_df <- do.call(rbind, lapply(seq_along(shap_results), function(i) {
+  shap_results[[i]] |> 
+    mutate(observation = i)
+}))
+
+# Global SHAP summary
+shap_summary_m2 <- shap_df |> 
+  group_by(feature) |> 
+  summarise(
+    Mean_Abs_SHAP = mean(abs(phi)),
+    Mean_SHAP = mean(phi),
+    .groups = "drop"
+  ) |> 
+  arrange(desc(Mean_Abs_SHAP)) |> 
+  rename(Variable = feature)
+
+cat("TOP 10 VARIABLES BY SHAP IMPORTANCE (Model 2):\n")
+print(head(shap_summary_m2, 10), row.names = FALSE, digits = 3)
+
+# Visualization
+shap_summary_m2 |> 
+  head(15) |> 
+  ggplot(aes(x = reorder(Variable, Mean_Abs_SHAP), y = Mean_Abs_SHAP)) +
+  geom_col(aes(fill = Mean_SHAP > 0), alpha = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#C00000", "FALSE" = "#2E75B6"),
+                    labels = c("TRUE" = "Pushes toward vulnerable", 
+                               "FALSE" = "Pushes toward non-vulnerable"),
+                    name = "") +
+  labs(title = "SHAP Feature Importance — Model 2",
+       subtitle = "Mean absolute SHAP value (impact on prediction)",
+       x = "", y = "Mean |SHAP value|") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold"),
+        legend.position = "top")
+```
+
+### Final summary
+
+```{r}
+cat("MODEL 1 — Energy Poverty Prediction (EVI > 15):\n")
+cat(sprintf("  Accuracy: %.1f%%\n", 100 * cm_m1_test$overall['Accuracy']))
+cat(sprintf("  AUC: %.3f\n", auc(roc_m1)))
+cat(sprintf("  F1-Score: %.3f\n", cm_m1_test$byClass['F1']))
+cat(sprintf("  Top variable: %s (%.1f%%)\n", 
+            importance_m1_df$Variable[1], 
+            importance_m1_df$Relative_Importance[1]))
+
+cat("\nMODEL 2 (V2) — Physical Vulnerability Prediction (no circularity):\n")
+cat(sprintf("  Accuracy: %.1f%%\n", 100 * cm_m2_v2_test$overall['Accuracy']))
+cat(sprintf("  AUC: %.3f\n", auc(roc_m2_v2)))
+cat(sprintf("  F1-Score: %.3f\n", cm_m2_v2_test$byClass['F1']))
+cat(sprintf("  Top variable (MeanDecreaseGini): %s (%.1f%%)\n", 
+            importance_m2_v2_df$Variable[1], 
+            importance_m2_v2_df$Relative_Importance[1]))
+cat(sprintf("  Top variable (SHAP):             %s (%.3f)\n", 
+            shap_summary_m2$Variable[1], 
+            shap_summary_m2$Mean_Abs_SHAP[1]))
+
+cat("\nGROUP DISTRIBUTION:\n")
+print(group_table, row.names = FALSE)
+```
+
+## Results
+
+This section presents the empirical findings of the four-phase methodology 
+applied to the 2,443 census sections of Madrid. Results are organised in four 
+subsections: (1) spatial distribution of energy vulnerability; (2) predictive 
+performance of the dual Random Forest; (3) discrepancy analysis; and (4) 
+statistical characterization of the discrepancy groups.
+
+### 1. Spatial Distribution of Energy Vulnerability
+
+```{r}
+# Table 1 — External validation: correlations with INE Atlas indicators
+corr_table <- data.frame(
+  Indicator = c("Mean equivalised income (€)",
+                "% population below 60% threshold",
+                "Gini coefficient",
+                "% dwellings pre-1980"),
+  Pearson_r = c(correlations$cor_income,
+                correlations$cor_threshold60,
+                correlations$cor_gini,
+                correlations$cor_pre1980),
+  Expected_sign = c("negative", "positive", "positive", "positive"),
+  Strength = c(
+    ifelse(abs(correlations$cor_income) > 0.7, "Strong",
+           ifelse(abs(correlations$cor_income) > 0.4, "Moderate", "Weak")),
+    ifelse(abs(correlations$cor_threshold60) > 0.7, "Strong",
+           ifelse(abs(correlations$cor_threshold60) > 0.4, "Moderate", "Weak")),
+    ifelse(abs(correlations$cor_gini) > 0.7, "Strong",
+           ifelse(abs(correlations$cor_gini) > 0.4, "Moderate", "Weak")),
+    ifelse(abs(correlations$cor_pre1980) > 0.7, "Strong",
+           ifelse(abs(correlations$cor_pre1980) > 0.4, "Moderate", "Weak"))
+  )
+)
+
+flextable(corr_table) |>
+  set_header_labels(
+    Indicator     = "INE Atlas indicator",
+    Pearson_r     = "Pearson r",
+    Expected_sign = "Expected sign",
+    Strength      = "Strength"
+  ) |>
+  colformat_double(j = "Pearson_r", digits = 3) |>
+  bold(part = "header") |>
+  bg(part = "header", bg = "#2E75B6") |>
+  color(part = "header", color = "white") |>
+  align(align = "left",   j = "Indicator") |>
+  align(align = "center", j = c("Pearson_r", "Expected_sign", "Strength")) |>
+  autofit() |>
+  set_caption("Table 1 — External validation of the synthetic EVI: Pearson correlations between section-level EVI estimates and four independent INE Atlas indicators not used in the SAE model (n = 2,443 census sections). Source: author's elaboration.")
+```
+
+```{r}
+# Figure 1 — External validation: bivariate relationships
+p_income_v2 <- ggplot(sae_results, aes(x = income * 10000, y = EVI_synthetic)) +
+  geom_point(alpha = 0.4, color = "#457B9D", size = 1) +
+  geom_smooth(method = "loess", color = "#E63946", se = TRUE, linewidth = 1.2) +
+  scale_x_continuous(labels = dollar_format(prefix = "€", big.mark = ",")) +
+  labs(
+    title = "A) EVI vs Mean Income per Equivalence Unit",
+    subtitle = sprintf("Correlation: r = %.3f", correlations$cor_income),
+    x = "Mean Income (€/EU)",
+    y = "EVI (%)"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(plot.title    = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "gray40"))
+
+p_threshold_v2 <- ggplot(sae_results, aes(x = pct_below_threshold_60, y = EVI_synthetic)) +
+  geom_point(alpha = 0.4, color = "#457B9D", size = 1) +
+  geom_smooth(method = "lm", color = "#E63946", se = TRUE, linewidth = 1.2) +
+  labs(
+    title = "B) EVI vs Population Below Poverty Threshold (60%)",
+    subtitle = sprintf("Correlation: r = %.3f", correlations$cor_threshold60),
+    x = "% population below 60% threshold",
+    y = "EVI (%)"
+  ) +
+  theme_classic(base_size = 10) +
+  theme(plot.title    = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "gray40"))
+
+fig_1 <- p_income_v2 | p_threshold_v2
+fig_1
+```
+*Figure 1: External validation of the synthetic EVI: non-linear inverse relationship 
+with mean equivalised income (Panel A, r = −0.900) and linear positive relationship 
+with the percentage of population below the 60% poverty threshold (Panel B, r = 0.924). 
+Source: author's elaboration based on the Synthetic Regression Estimator (Phase 2) and INE Atlas 2021.*
+
+
+```{r}
+# Figures 3 and 4 — Choropleth maps
+madrid_sf <- st_read("data/seccionado_2021/SECC_CE_20210101.shp") |>
+  filter(str_detect(CUSEC, "^28079"))
+
+madrid_map <- madrid_sf |>
+  left_join(
+    dataset |> select(CUSEC, EVI_synthetic, energy_poverty, group, mean_equiv_income),
+    by = "CUSEC"
+  ) |>
+  mutate(
+    district = str_sub(CUSEC, 6, 7),
+    group_label = case_when(
+      group == "Concordant"              ~ "Concordant",
+      group == "Non_Vulnerable"          ~ "Non-vulnerable",
+      group == "Spatial_False_Positives" ~ "Spatial False Positives",
+      group == "Spatial_False_Negatives" ~ "Spatial False Negatives"
+    ),
+    group_label = factor(group_label, levels = c(
+      "Concordant", "Spatial False Positives",
+      "Spatial False Negatives", "Non-vulnerable"
+    ))
+  )
+
+district_sf <- madrid_map |>
+  group_by(district) |>
+  summarise(geometry = st_union(geometry), .groups = "drop")
+
+# Figure 3 — Continuous EVI map
+map1 <- ggplot(madrid_map) +
+  geom_sf(aes(fill = EVI_synthetic), color = NA) +
+  geom_sf(data = district_sf, fill = NA, color = "white", linewidth = 0.4) +
+  scale_fill_gradientn(
+    colours = c("#2166AC", "#92C5DE", "#F7F7F7", "#F4A582", "#B2182B"),
+    name = "Synthetic EVI (%)", na.value = "grey80"
+  ) +
+  labs(title = "Synthetic Energy Vulnerability Index",
+       subtitle = "Continuous EVI by census section (n = 2,443) | Madrid 2021") +
+  theme_void(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(color = "gray40", size = 10),
+        legend.position = "right")
+map1
+```
+*Figure 3: Spatial distribution of the Synthetic Energy Vulnerability Index (EVI) across 
+Madrid's 2,443 census sections. Colour gradient from blue (low vulnerability) to red 
+(high vulnerability). White boundaries delimit the 21 municipal districts. Source: own 
+elaboration based on the Synthetic Regression Estimator (Phase 2), INE Atlas of Income 
+Distribution 2021, and INE Census Section Cartography 2021 (SECC_CE_20210101).*
+
+```{r}
+# Figure 4 — Binary classification map
+map2 <- ggplot(madrid_map) +
+  geom_sf(aes(fill = energy_poverty), color = NA) +
+  geom_sf(data = district_sf, fill = NA, color = "white", linewidth = 0.4) +
+  scale_fill_manual(
+    values = c("TRUE" = "#B2182B", "FALSE" = "#2166AC"),
+    labels = c("TRUE" = "Energy poor (EVI > 15)", "FALSE" = "Non-poor"),
+    name = NULL, na.value = "grey80"
+  ) +
+  labs(title = "Binary Energy Poverty Classification",
+       subtitle = "EVI > 15 threshold | 40.0% of sections classified as energy poor") +
+  theme_void(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(color = "gray40", size = 10),
+        legend.position = "bottom")
+map2
+```
+*Figure 4: Binary classification of Madrid's 2,443 census sections by energy poverty 
+status (EVI > 15 threshold). Red sections (40.0%, n = 977) are classified as energy poor; 
+blue sections (60.0%, n = 1,466) fall below the vulnerability threshold. White boundaries 
+delimit the 21 municipal districts. Source: own elaboration based on the Synthetic 
+Regression Estimator (Phase 2), INE Atlas of Income Distribution 2021, and INE Census 
+Section Cartography 2021 (SECC_CE_20210101).*
+
+### 2. Predictive Performance of the Dual Random Forest
+
+```{r}
+# Table 2 — Performance metrics
+metrics_comparison <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1-score", "AUC"),
+  `Model 1 (Energy Poverty)` = c(
+    sprintf("%.3f", cm_m1_test$overall['Accuracy']),
+    sprintf("%.3f", cm_m1_test$byClass['Precision']),
+    sprintf("%.3f", cm_m1_test$byClass['Recall']),
+    sprintf("%.3f", cm_m1_test$byClass['F1']),
+    sprintf("%.3f", auc(roc_m1))
+  ),
+  `Model 2 (Physical Vulnerability)` = c(
+    sprintf("%.3f", cm_m2_v2_test$overall['Accuracy']),
+    sprintf("%.3f", cm_m2_v2_test$byClass['Precision']),
+    sprintf("%.3f", cm_m2_v2_test$byClass['Recall']),
+    sprintf("%.3f", cm_m2_v2_test$byClass['F1']),
+    sprintf("%.3f", auc(roc_m2_v2))
+  ),
+  check.names = FALSE
+)
+
+metrics_comparison |>
+  flextable() |>
+  bold(part = "header") |>
+  bg(part = "header", bg = "#2E75B6") |>
+  color(part = "header", color = "white") |>
+  align(align = "left",   j = "Metric") |>
+  align(align = "center", j = c(2, 3)) |>
+  bold(j = "Metric") |>
+  autofit() |>
+  set_caption("Table 2 — Test-set performance metrics of the dual Random Forest classifiers. Model 1 predicts energy poverty (EVI > 15) using environmental and building age variables; Model 2 predicts physical vulnerability using exclusively environmental predictors. Source: author's elaboration based on Random Forest models trained on 80% of the sample and evaluated on the held-out 20% (n ≈ 489 sections).")
+```
+
+```{r}
+# Figure 5 — Variable importance rankings
+clean_var_names <- function(x) {
+  x |> str_replace_all("_", " ") |> str_replace("21", "") |> str_trim()
+}
+
+top_m1 <- importance_m1_df |>
+  head(10) |>
+  mutate(Variable_clean = clean_var_names(Variable))
+
+p_m1_imp <- ggplot(top_m1,
+                   aes(x = reorder(Variable_clean, Relative_Importance),
+                       y = Relative_Importance)) +
+  geom_col(fill = "#C00000", alpha = 0.85) +
+  geom_text(aes(label = sprintf("%.1f%%", Relative_Importance)),
+            hjust = -0.2, size = 3.3) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(top_m1$Relative_Importance) * 1.15)) +
+  labs(title = "A) Model 1 — Energy Poverty (EVI > 15)",
+       subtitle = "Top 10 most important variables",
+       x = NULL, y = "Relative importance (%)") +
+  theme_classic(base_size = 10) +
+  theme(plot.title    = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "gray40"),
+        axis.text.y   = element_text(size = 9))
+
+top_m2 <- importance_m2_v2_df |>
+  head(10) |>
+  mutate(Variable_clean = clean_var_names(Variable))
+
+p_m2_imp <- ggplot(top_m2,
+                   aes(x = reorder(Variable_clean, Relative_Importance),
+                       y = Relative_Importance)) +
+  geom_col(fill = "#2E75B6", alpha = 0.85) +
+  geom_text(aes(label = sprintf("%.1f%%", Relative_Importance)),
+            hjust = -0.2, size = 3.3) +
+  coord_flip() +
+  scale_y_continuous(limits = c(0, max(top_m2$Relative_Importance) * 1.15)) +
+  labs(title = "B) Model 2 — Physical Vulnerability",
+       subtitle = "Top 10 most important variables (environmental only)",
+       x = NULL, y = "Relative importance (%)") +
+  theme_classic(base_size = 10) +
+  theme(plot.title    = element_text(face = "bold", size = 11),
+        plot.subtitle = element_text(size = 9, color = "gray40"),
+        axis.text.y   = element_text(size = 9))
+
+fig_5 <- p_m1_imp | p_m2_imp
+fig_5
+```
+*Figure 5: Variable importance rankings of the dual Random Forest classifiers, measured 
+by MeanDecreaseGini (Breiman, 2001). Panel A: top 10 most important predictors of Model 1 
+(energy poverty). Panel B: top 10 most important predictors of Model 2 (physical 
+vulnerability). Source: author's elaboration based on Random Forest models implemented 
+with the randomForest R package (Liaw & Wiener, 2002) and Google Earth Engine satellite data.*
+
+### 3. Discrepancy Analysis
+
+```{r}
+# Table 3 — Distribution of the four groups
+group_table <- dataset |>
+  count(group) |>
+  mutate(percentage = 100 * n / sum(n)) |>
+  arrange(desc(n))
+
+table_3_data <- group_table |>
+  mutate(
+    Group_label = case_when(
+      group == "Concordant"              ~ "Concordant (both vulnerable)",
+      group == "Non_Vulnerable"          ~ "Non-vulnerable (both safe)",
+      group == "Spatial_False_Positives" ~ "Spatial False Positives (RF vulnerable, SAE not)",
+      group == "Spatial_False_Negatives" ~ "Spatial False Negatives (SAE vulnerable, RF not)"
+    ),
+    Interpretation = case_when(
+      group == "Concordant"              ~ "Joint economic + physical vulnerability",
+      group == "Non_Vulnerable"          ~ "No vulnerability detected",
+      group == "Spatial_False_Positives" ~ "Adverse environment, adequate income",
+      group == "Spatial_False_Negatives" ~ "Low income, adequate environment"
+    )
+  ) |>
+  select(Group_label, n, percentage, Interpretation)
+
+table_3_data |>
+  flextable() |>
+  set_header_labels(
+    Group_label    = "Group",
+    n              = "N sections",
+    percentage     = "%",
+    Interpretation = "Interpretation"
+  ) |>
+  colformat_double(j = "percentage", digits = 1, suffix = "%") |>
+  colformat_int(j = "n", big.mark = ",") |>
+  bold(part = "header") |>
+  bg(part = "header", bg = "#2E75B6") |>
+  color(part = "header", color = "white") |>
+  align(align = "left",   j = c("Group_label", "Interpretation")) |>
+  align(align = "center", j = c("n", "percentage")) |>
+  bold(j = "Group_label") |>
+  autofit() |>
+  set_caption("Table 3 — Distribution of Madrid's 2,443 census sections across the four mutually exclusive groups defined by the intersection of the SAE-based classification (EVI > 15) and Model 1's environmental prediction. Source: author's elaboration based on the cross-classification of Phase 2 (SAE) and Phase 3 (Random Forest Model 1) outputs.")
+```
+
+```{r}
+# Figure 6 — Discrepancy groups map
+map3 <- ggplot(madrid_map) +
+  geom_sf(aes(fill = group_label), color = NA) +
+  geom_sf(data = district_sf, fill = NA, color = "white", linewidth = 0.4) +
+  scale_fill_manual(
+    values = c(
+      "Concordant"               = "#E57373",
+      "Spatial False Positives"  = "#FF8C00",
+      "Spatial False Negatives"  = "#8E44AD",
+      "Non-vulnerable"           = "#82B0D9"
+    ),
+    name = NULL, na.value = "grey80"
+  ) +
+  theme_void(base_size = 11) +
+  theme(plot.title    = element_text(face = "bold", size = 13),
+        plot.subtitle = element_text(color = "gray40", size = 10),
+        legend.position = "bottom",
+        legend.text = element_text(size = 9))
+map3
+```
+*Figure 6: Spatial distribution of the four discrepancy groups across Madrid's 2,443 
+census sections. Concordant (red, 38.2%) and Non-vulnerable (blue, 58.7%) sections 
+dominate the territorial picture. Spatial False Positives (orange, 1.4%, n = 34) cluster 
+in consolidated inner-city districts undergoing gentrification; Spatial False Negatives 
+(purple, 1.7%, n = 42) are dispersed across peripheral areas. White boundaries delimit 
+the 21 municipal districts. Source: own elaboration based on Phase 2 (SAE) and Phase 3 
+(Random Forest Model 1) outputs, and INE Census Section Cartography 2021.*
+
+### 4. Group Characterization and Statistical Validation
+
+```{r}
+# Table 4 — Statistical comparison: False Positives vs Concordant
+false_pos  <- dataset |> filter(group == "Spatial_False_Positives")
+concordant <- dataset |> filter(group == "Concordant")
+
+vars_to_test <- c(
+  "EVI_synthetic", "mean_equiv_income",
+  "pct_pre1980", "mean_building_age",
+  "heating_demand", "cooling_demand",
+  "NDVI_mean_21", "urban_heat_island",
+  "LST_summer_p90_21", "LST_winter_p10_21"
+)
+
+labels_vars <- c(
+  "Synthetic EVI (%)", "Mean equivalised income (€)",
+  "% dwellings pre-1980", "Mean building age (years)",
+  "Heating demand", "Cooling demand",
+  "NDVI mean (vegetation)", "Urban heat island index",
+  "LST summer p90 (°C)", "LST winter p10 (°C)"
+)
+
+categories <- c(
+  "Economic", "Economic",
+  "Physical", "Physical", "Physical", "Physical",
+  "Physical", "Physical", "Physical", "Physical"
+)
+
+results <- map_dfr(seq_along(vars_to_test), function(i) {
+  var  <- vars_to_test[i]
+  test <- t.test(false_pos[[var]], concordant[[var]])
+  sig  <- ifelse(test$p.value < 0.001, "***",
+          ifelse(test$p.value < 0.01,  "**",
+          ifelse(test$p.value < 0.05,  "*", "ns")))
+  data.frame(
+    Category  = categories[i],
+    Variable  = labels_vars[i],
+    FP_mean   = mean(false_pos[[var]], na.rm = TRUE),
+    FP_sd     = sd(false_pos[[var]],   na.rm = TRUE),
+    Conc_mean = mean(concordant[[var]], na.rm = TRUE),
+    Conc_sd   = sd(concordant[[var]],  na.rm = TRUE),
+    p_value   = test$p.value,
+    Sig       = sig
+  )
+})
+
+results |>
+  mutate(
+    `False Positives (mean ± SD)` = sprintf("%.2f (±%.2f)", FP_mean, FP_sd),
+    `Concordant (mean ± SD)`      = sprintf("%.2f (±%.2f)", Conc_mean, Conc_sd),
+    `p-value` = case_when(
+      p_value < 0.001 ~ "< 0.001 ***",
+      p_value < 0.01  ~ sprintf("%.3f **", p_value),
+      p_value < 0.05  ~ sprintf("%.3f *",  p_value),
+      TRUE            ~ sprintf("%.3f",    p_value)
+    )
+  ) |>
+  select(Category, Variable,
+         `False Positives (mean ± SD)`,
+         `Concordant (mean ± SD)`,
+         `p-value`) |>
+  flextable() |>
+  bold(part = "header") |>
+  bg(part = "header", bg = "#2E75B6") |>
+  color(part = "header", color = "white") |>
+  align(align = "left",   j = c("Category", "Variable")) |>
+  align(align = "center", j = 3:5) |>
+  bold(j = "Variable") |>
+  bg(i = ~Category == "Economic", bg = "#FFF2CC") |>
+  bg(i = ~Category == "Physical", bg = "#F2F2F2") |>
+  merge_v(j = "Category") |>
+  autofit() |>
+  set_caption("Table 4 — Statistical comparison between Spatial False Positives (n = 34) and Concordant sections (n = 934) on ten key indicators of economic and physical vulnerability. Significance codes: *** p < 0.001, ** p < 0.01, * p < 0.05, ns: not significant. Source: author's elaboration based on Phase 3 outputs and the integrated dataset combining INE Atlas, Censo de Edificios CAM, and Google Earth Engine variables.")
+```

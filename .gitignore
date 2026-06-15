@@ -1,0 +1,9 @@
+# Ignore datasets that exceed GitHub's upload limits (>50-100 MB)
+data/Atlas_umbral_sexo.csv
+data/seccionado_2021/SECC_CE_20210101.shp
+
+# Ignore R temporary files, history, and local user configurations
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/

@@ -1,0 +1,52 @@
+---
+title: "README"
+output: html_document
+date: "2026-06-15"
+---
+
+# Seeing the Invisible: Spatial Auditing of Energy Poverty in Madrid
+
+This repository contains the source code and replicable pipeline for the **Master's Thesis (TFM)** submitted in partial fulfillment of the requirements for the *Master in Computational Social Science* at Universidad Carlos III de Madrid (UC3M).
+
+**Author:** María Garcés Blázquez  
+**Academic Year:** 2025--2026  
+
+---
+
+## Project Overview
+The main objective of this study is to estimate, predict, and audit energy poverty at the census section level within the municipality of Madrid. To achieve this, we develop a hybrid 4-phase methodological framework that integrates traditional socioeconomic administrative data with satellite remote sensing variables derived from Google Earth Engine (GEE).
+
+The computational workflow implemented in this project is structured as follows:
+1. **Phase 1 — Census Master File Construction & Imputation:** Integration of 10 administrative data sources and treatment of missing values using non-parametric multivariate imputation via `missForest`.
+2. **Phase 2 — Small Area Estimation (SAE):** Downscaling regional survey data using a Synthetic Regression Estimator (Rao & Molina, 2015) via a logistic mixed-effects model trained on microdata from the Living Conditions Survey (ECV).
+3. **Phase 3 — Predictive Models (Dual Random Forest):** Construction of complementary Random Forest classifiers using environmental satellite metrics (LST, NDVI, NDBI, Albedo) and cadastral infrastructure features to predict energy vulnerability status.
+4. **Phase 4 — Discrepancy Analysis & Group Characterization:** Identification and statistical validation of territorial subgroups to isolate cases of "invisible energy poverty" (spatial false negatives and spatial false positives).
+
+---
+
+## Repository Structure
+
+* `tfm-energy-poverty.Rproj`: RStudio project configuration file.
+* `README.md`: This markdown documentation file providing replication instructions.
+* `code_tfm.qmd`: Centralized Quarto script containing the entire executable pipeline (data processing, missing data CV, SAE modeling, Random Forest training, SHAP values local interpretability, and exploratory visualizations).
+
+### Data Dependencies (`/data`)
+Due to GitHub's file size restrictions (strict 100 MB limit per file), the heaviest raw data files have been excluded from this repository using `.gitignore`. 
+
+To fully replicate this pipeline, you must independently download the following files from the Spanish National Statistics Institute (INE) and place them inside your local `data/` folder:
+* **`Atlas_umbral_sexo.csv`** (~135 MB): Available at the [INE - Household Income Distribution Atlas](https://www.ine.es/componentes_inebase/ADRH_total_nacional.htm).
+* **`SECC_CE_20210101.shp`** (~108 MB): Digital cartography of census sections, available at the [INE - Cartografía Digital](https://www.ine.es/dyngs/DAB/index.htm?cid=1389).
+
+*Note: Smaller supplementary files (`Atlas_renta.csv`, `Atlas_demografia.csv`, `2022.xlsx`, etc.) should remain in your local layout as specified by the paths in the script.*
+
+---
+
+## Requirements & Installation
+
+The entire pipeline has been developed using **R (v4.x)** and compiles into an interactive HTML document via **Quarto**. To install all the required packages to execute the code, run the following command in your R console:
+
+```R
+install.packages(c("tidyverse", "sf", "readxl", "mice", "missForest", 
+                   "Amelia", "ggplot2", "Hmisc", "patchwork", "lme4", 
+                   "MuMIn", "flextable", "scales", "randomForest", 
+                   "caret", "pROC", "iml"))
